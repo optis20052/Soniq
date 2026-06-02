@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -36,6 +37,11 @@ pub struct AppState {
     /// The HTTP source element (souphttpsrc) - used to query the total
     /// byte size of the stream for the buffer indicator.
     pub source_ref: Arc<Mutex<Option<gst::Element>>>,
+    /// True while the current source is a network stream that should cache to
+    /// disk (the `download` play flag is on). Read on the streaming thread by
+    /// the deep-element-added hook, which redirects the download temp file off
+    /// the default tmpfs onto real disk - so it must be an atomic, not a Cell.
+    pub net_download: Arc<AtomicBool>,
     /// User-configurable keyboard bindings.
     pub shortcuts: Shortcuts,
     /// Mouse single / double-click bindings.
@@ -81,6 +87,7 @@ impl AppState {
             dl_state: Rc::new(Cell::new((Instant::now(), 0))),
             queue_ref: Arc::new(Mutex::new(None)),
             source_ref: Arc::new(Mutex::new(None)),
+            net_download: Arc::new(AtomicBool::new(false)),
             shortcuts: Shortcuts::defaults(),
             mouse: MouseBindings::defaults(),
             pending_restore_pos: Rc::new(Cell::new(None)),

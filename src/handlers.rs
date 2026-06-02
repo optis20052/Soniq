@@ -38,6 +38,7 @@ pub fn wire(
         let user_paused = state.user_paused.clone();
         let queue_ref = state.queue_ref.clone();
         let source_ref = state.source_ref.clone();
+        let net_download = state.net_download.clone();
         let subs_load = state.subtitles.clone();
         let playlist = state.playlist.clone();
         let playlist_idx = state.playlist_idx.clone();
@@ -65,11 +66,15 @@ pub fn wire(
             pipeline.set_state(gst::State::Null).ok();
             // Set playbin3 flags based on source type. For local files the
             // +buffering flag (and the queue2 it inserts) is dead weight that
-            // can wedge on heavy seeking.
+            // can wedge on heavy seeking. For network streams we add +download
+            // so playbin caches the stream to a disk file (relocated off the
+            // tmpfs in pipeline.rs): seeks within the watched range are then
+            // served from disk instead of re-requesting from the server.
+            net_download.store(!local, std::sync::atomic::Ordering::Relaxed);
             let flags = if local {
                 crate::subtitles::DEFAULT_FLAGS.to_string()
             } else {
-                format!("{}+buffering", crate::subtitles::DEFAULT_FLAGS)
+                format!("{}+buffering+download", crate::subtitles::DEFAULT_FLAGS)
             };
             subs_load.set_flags(&pipeline, &flags);
             pipeline.set_property("uri", uri.as_str());
@@ -668,7 +673,8 @@ pub fn wire(
         let save_state = state.clone();
         ui.window.connect_close_request(move |_| {
             crate::config::save(&save_state); // persist settings
-            pipeline.set_state(gst::State::Null).ok();
+            pipeline.set_state(gst::State::Null).ok(); // finalizes downloadbuffer (temp-remove)
+            crate::pipeline::clear_download_cache(); // belt-and-suspenders: wipe any cache file
             let _ = &bus_watch; // keep the bus watch guard alive until the window dies
             Propagation::Proceed
         });

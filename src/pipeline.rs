@@ -60,19 +60,49 @@ pub fn build_pipeline(state: &AppState) -> PipelineHandles {
         "soft-colorbalance+deinterlace+soft-volume+text+audio+video",
     );
 
-    // Force urisourcebin to enable buffering with our settings (playbin3's
-    // +buffering flag doesn't always propagate reliably).
+    // On-disk download cache. When the `download` play flag is on (network
+    // streams), GStreamer's download buffer would default to g_get_tmp_dir()
+    // which is often a small tmpfs (-> "Disk quota exceeded" on a large file).
+    // We redirect it to a real cache dir and clear any leftovers from a
+    // previous (crashed) run, so seeks within the watched range are served
+    // from this file instead of re-downloading.
+    let cache_template = download_cache_template();
     let queue_ref_setter = state.queue_ref.clone();
+    let net_download = state.net_download.clone();
     let subs_overlay_setter = state.subtitles.overlay_ref.clone();
     let subs_style_setter = state.subtitles.style.clone();
     pipeline.connect_closure(
         "deep-element-added",
         false,
         gst::glib::closure!(move |_pb: gst::Element, _bin: gst::Bin, element: gst::Element| {
+            use std::sync::atomic::Ordering;
             let factory_name = element
                 .factory()
                 .map(|f| f.name().to_string())
                 .unwrap_or_default();
+
+            // Redirect the download cache off the default tmpfs onto real disk.
+            // `downloadbuffer` only exists in download mode; a `queue2` is the
+            // download element only once it already has a temp-template (small
+            // inline queue2s have none, so we never disk-back those). Gated on
+            // net_download so local playback never touches disk.
+            if let Some(ref template) = cache_template
+                && net_download.load(Ordering::Relaxed)
+                && element.has_property("temp-template", None)
+            {
+                let is_download_elem = factory_name == "downloadbuffer"
+                    || (factory_name == "queue2"
+                        && element
+                            .property::<Option<String>>("temp-template")
+                            .map(|t| !t.is_empty())
+                            .unwrap_or(false));
+                if is_download_elem {
+                    element.set_property("temp-template", template.as_str());
+                    if element.has_property("temp-remove", None) {
+                        element.set_property("temp-remove", true);
+                    }
+                }
+            }
 
             // Log decode/render/subtitle elements so we can confirm the active
             // decode path and whether the subtitle overlay is created.
@@ -220,4 +250,45 @@ pub fn build_pipeline(state: &AppState) -> PipelineHandles {
     pipeline.set_property("text-sink", text_sink.upcast::<gst::Element>());
 
     PipelineHandles { pipeline, paintable }
+}
+
+/// The on-disk download-cache directory: `$XDG_CACHE_HOME/soniq` (falling back
+/// to `~/.cache/soniq`). `None` if neither env var is set.
+fn download_cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("soniq"))
+}
+
+/// Delete every `stream-cache-*` file in the cache directory. The downloadbuffer
+/// removes its own file on a clean stop (`temp-remove`), but a crash can orphan
+/// a multi-GB file; we call this on startup and on shutdown so a stale cache
+/// never lingers.
+pub fn clear_download_cache() {
+    let Some(dir) = download_cache_dir() else { return };
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("stream-cache-")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Prepare the on-disk download-cache location and return an mkstemp-style
+/// template (".../stream-cache-XXXXXX") for queue2/downloadbuffer's
+/// `temp-template`. Creates the cache dir and clears any stale cache files left
+/// by a previous run. Returns `None` if no cache dir could be created, in which
+/// case we leave the default (tmpfs) location untouched.
+fn download_cache_template() -> Option<String> {
+    let dir = download_cache_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    clear_download_cache();
+    Some(dir.join("stream-cache-XXXXXX").to_string_lossy().into_owned())
 }
