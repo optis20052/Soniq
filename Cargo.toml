@@ -1,0 +1,33 @@
+[package]
+name = "soniq"
+version = "0.1.2"
+edition = "2024"
+description = "Soniq — a minimal, modern GTK4/libadwaita video player"
+license = "MIT"
+
+[dependencies]
+gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+gst = { version = "0.23", package = "gstreamer" }
+gst-app = { version = "0.23", package = "gstreamer-app" }
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[package.metadata.deb]
+maintainer = "Ali <ali@spentys.com>"
+copyright = "2026, Ali <ali@spentys.com>"
+extended-description = "Soniq — a minimal, modern video player built with Rust, GTK4, libadwaita and GStreamer."
+section = "video"
+priority = "optional"
+assets = [
+    ["target/release/soniq", "usr/bin/", "755"],
+    ["packaging/io.github.alisp.Soniq.desktop", "usr/share/applications/", "644"],
+    ["assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/io.github.alisp.Soniq.svg", "644"],
+]
+depends = "$auto, libgtk-4-1, libadwaita-1-0, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, gstreamer1.0-gtk4, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav"

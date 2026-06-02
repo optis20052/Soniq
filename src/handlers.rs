@@ -1,0 +1,2094 @@
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+use adw::prelude::*;
+use gst::prelude::*;
+use gtk::gdk;
+use gtk::gio;
+use gtk::pango;
+use gtk::glib::{self, ControlFlow, Propagation};
+
+use crate::pipeline::PipelineHandles;
+use crate::shortcuts::Action;
+use crate::state::AppState;
+use crate::ui::UiHandles;
+use crate::util::format_time;
+
+/// Wire every event handler, timer, and bus watcher onto the widgets.
+/// Wire all event handlers and return the shared `load_file` closure so the
+/// application's `open` handler (file-manager "Open With") can load files.
+pub fn wire(
+    ui: &UiHandles,
+    pipe: &PipelineHandles,
+    state: &AppState,
+) -> Rc<dyn Fn(&gio::File)> {
+    let pipeline = &pipe.pipeline;
+
+    // ---------- Shared load_file closure ----------
+    let load_file: Rc<dyn Fn(&gio::File)> = {
+        let pipeline = pipeline.clone();
+        let play_btn = ui.play_btn.clone();
+        let title_label = ui.title_label.clone();
+        let window_weak = ui.window.downgrade();
+        let content_stack = ui.content_stack.clone();
+        let controls = ui.controls.clone();
+        let seek_scale = ui.seek_scale.clone();
+        let is_local = state.is_local.clone();
+        let user_paused = state.user_paused.clone();
+        let queue_ref = state.queue_ref.clone();
+        let source_ref = state.source_ref.clone();
+        let subs_load = state.subtitles.clone();
+        let playlist = state.playlist.clone();
+        let playlist_idx = state.playlist_idx.clone();
+        let volume_scale = ui.volume_scale.clone();
+        let osd = ui.osd.clone();
+        Rc::new(move |file: &gio::File| {
+            let uri = file.uri();
+            let local = uri.starts_with("file://");
+            is_local.set(local);
+            user_paused.set(false);
+            // Build the folder playlist for Next/Previous + auto-advance.
+            if local && let Some(path) = file.path() {
+                let (list, idx) = scan_playlist(&path);
+                *playlist.borrow_mut() = list;
+                playlist_idx.set(idx);
+            } else {
+                playlist.borrow_mut().clear();
+            }
+            // Reset stashed element refs - the new load creates fresh source /
+            // queue2 elements, and the deep-element-added / source-setup hooks
+            // re-stash them. Without this, switching local→stream leaves the
+            // streaming indicators pointing at the previous (dead) elements.
+            *queue_ref.lock().unwrap() = None;
+            *source_ref.lock().unwrap() = None;
+            pipeline.set_state(gst::State::Null).ok();
+            // Set playbin3 flags based on source type. For local files the
+            // +buffering flag (and the queue2 it inserts) is dead weight that
+            // can wedge on heavy seeking.
+            let flags = if local {
+                crate::subtitles::DEFAULT_FLAGS.to_string()
+            } else {
+                format!("{}+buffering", crate::subtitles::DEFAULT_FLAGS)
+            };
+            subs_load.set_flags(&pipeline, &flags);
+            pipeline.set_property("uri", uri.as_str());
+            // Hand the chosen subtitle font to playbin3 up front.
+            pipeline.set_property("subtitle-font-desc", subs_load.font_desc());
+            // Re-apply the current UI volume - the reload can reset playbin's
+            // volume to 100%, which would desync from the slider.
+            pipeline.set_property("volume", volume_scale.value());
+            pipeline.set_state(gst::State::Playing).ok();
+            play_btn.set_icon_name("media-playback-pause-symbolic");
+            content_stack.set_visible_child_name("video");
+            controls.set_visible(true);
+            seek_scale.set_fill_level(if local { 1.0 } else { 0.0 });
+            if let Some(name) = file.basename().map(|p| p.to_string_lossy().into_owned()) {
+                title_label.set_text(&name);
+                osd.show("media-playback-start-symbolic", &name);
+                if let Some(window) = window_weak.upgrade() {
+                    window.set_title(Some(&format!("{name} \u{2014} Soniq")));
+                }
+            }
+        })
+    };
+
+    // ---------- Playlist navigation (Next / Previous / auto-advance) ----------
+    // navigate(+1) = next file, navigate(-1) = previous. No wrap-around: at the
+    // ends it does nothing (auto-advance past the last file simply stops).
+    let navigate: Rc<dyn Fn(i32)> = {
+        let load_file = load_file.clone();
+        let playlist = state.playlist.clone();
+        let playlist_idx = state.playlist_idx.clone();
+        Rc::new(move |delta: i32| {
+            let list = playlist.borrow();
+            if list.is_empty() {
+                return;
+            }
+            let cur = playlist_idx.get() as i32;
+            let next = cur + delta;
+            if next < 0 || next as usize >= list.len() {
+                return; // at a boundary
+            }
+            let path = list[next as usize].clone();
+            drop(list);
+            load_file(&gio::File::for_path(&path));
+        })
+    };
+    {
+        let navigate = navigate.clone();
+        ui.next_btn.connect_clicked(move |_| navigate(1));
+    }
+    {
+        let navigate = navigate.clone();
+        ui.prev_btn.connect_clicked(move |_| navigate(-1));
+    }
+
+    // ---------- Open file dialog ----------
+    {
+        let window_weak = ui.window.downgrade();
+        let load_file = load_file.clone();
+        ui.open_btn.connect_clicked(move |_| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let video_filter = gtk::FileFilter::new();
+            video_filter.set_name(Some("Video files"));
+            video_filter.add_mime_type("video/*");
+
+            let all_filter = gtk::FileFilter::new();
+            all_filter.set_name(Some("All files"));
+            all_filter.add_pattern("*");
+
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&video_filter);
+            filters.append(&all_filter);
+
+            let dialog = gtk::FileDialog::builder()
+                .title("Open Video")
+                .modal(true)
+                .filters(&filters)
+                .default_filter(&video_filter)
+                .build();
+
+            let load_file = load_file.clone();
+            dialog.open(Some(&window), gio::Cancellable::NONE, move |result| {
+                let Ok(file) = result else { return };
+                load_file(&file);
+            });
+        });
+    }
+
+    // ---------- Open URL dialog ----------
+    {
+        let window_weak = ui.window.downgrade();
+        let load_file = load_file.clone();
+        let url_osd = ui.osd.clone();
+        ui.link_btn.connect_clicked(move |_| {
+            let Some(window) = window_weak.upgrade() else { return };
+
+            let entry = gtk::Entry::builder()
+                .placeholder_text("https://example.com/video.mp4")
+                .hexpand(true)
+                .activates_default(true)
+                .input_purpose(gtk::InputPurpose::Url)
+                .build();
+
+            let clipboard = window.clipboard();
+            let entry_for_clip = entry.clone();
+            clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
+                if let Ok(Some(text)) = result {
+                    let t = text.trim();
+                    if t.starts_with("http://")
+                        || t.starts_with("https://")
+                        || t.starts_with("rtsp://")
+                        || t.starts_with("rtmp://")
+                    {
+                        entry_for_clip.set_text(t);
+                        entry_for_clip.select_region(0, -1);
+                    }
+                }
+            });
+
+            let dialog = adw::AlertDialog::builder()
+                .heading("Open URL")
+                .body("Direct video URL \u{2014} http(s), rtsp, rtmp, file://")
+                .extra_child(&entry)
+                .default_response("open")
+                .close_response("cancel")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("open", "Open");
+            dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+
+            let load_file = load_file.clone();
+            let entry_for_resp = entry.clone();
+            let url_osd = url_osd.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response != "open" {
+                    return;
+                }
+                let raw = entry_for_resp.text().to_string();
+                let url = raw.trim();
+                if url.is_empty() {
+                    return;
+                }
+                // Basic sanity check: a real URL has a scheme (foo://) or at
+                // least a dotted host (example.com) - otherwise it's junk like
+                // "XX" that would only produce a cryptic playback error.
+                let looks_like_url = url.contains("://")
+                    || (url.contains('.') && !url.starts_with('.') && !url.ends_with('.'));
+                if !looks_like_url {
+                    url_osd.show("dialog-warning-symbolic", "That doesn't look like a valid URL");
+                    return;
+                }
+                let full = if url.contains("://") {
+                    url.to_string()
+                } else {
+                    format!("https://{url}")
+                };
+                let file = gio::File::for_uri(&full);
+                load_file(&file);
+            });
+
+            dialog.present(Some(&window));
+        });
+    }
+
+    // ---------- Preferences window ----------
+    {
+        let show_debug = state.show_debug.clone();
+        let debug_label = ui.debug_label.clone();
+        let shortcuts = state.shortcuts.clone();
+        let state_mouse = state.mouse.clone();
+        let subs_prefs = state.subtitles.clone();
+        let subtitle_css_prefs = ui.subtitle_css.clone();
+        let subtitle_label_prefs = ui.subtitle_label.clone();
+        ui.settings_btn.connect_clicked(move |_| {
+            // === General page ===
+            let dev_group = adw::PreferencesGroup::builder()
+                .title("Developer")
+                .description("Tools for debugging playback")
+                .build();
+
+            let net_row = adw::SwitchRow::builder()
+                .title("Show network stats")
+                .subtitle("Overlay download progress and pipeline state on the video")
+                .active(show_debug.get())
+                .build();
+            {
+                let show_debug = show_debug.clone();
+                let debug_label = debug_label.clone();
+                net_row.connect_active_notify(move |row| {
+                    let on = row.is_active();
+                    show_debug.set(on);
+                    debug_label.set_visible(on);
+                });
+            }
+            dev_group.add(&net_row);
+
+            let general_page = adw::PreferencesPage::builder()
+                .title("General")
+                .icon_name("applications-system-symbolic")
+                .build();
+            general_page.add(&dev_group);
+
+            // === Shortcuts page ===
+            let sc_group = adw::PreferencesGroup::builder()
+                .title("Keyboard shortcuts")
+                .description("Click a binding to change it. Esc cancels capture.")
+                .build();
+
+            let reset_btn = gtk::Button::with_label("Reset to defaults");
+            reset_btn.add_css_class("flat");
+            sc_group.set_header_suffix(Some(&reset_btn));
+
+            let mut row_labels: Vec<(Action, gtk::Label)> = Vec::new();
+
+            // Create the window up front so we can pass it as the parent to
+            // the per-row capture-shortcut dialogs.
+            let pref_window = adw::PreferencesWindow::builder()
+                .title("Preferences")
+                .default_width(680)
+                .default_height(560)
+                .modal(false)
+                .build();
+
+            for &action in crate::shortcuts::Action::all() {
+                let row = adw::ActionRow::builder()
+                    .title(action.title())
+                    .activatable(true)
+                    .build();
+                let key_label = gtk::Label::new(Some(""));
+                key_label.add_css_class("dim-label");
+                key_label.add_css_class("numeric");
+                if let Some(s) = shortcuts.get(action) {
+                    key_label.set_text(&s.label());
+                }
+                row.add_suffix(&key_label);
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+
+                {
+                    let shortcuts = shortcuts.clone();
+                    let key_label = key_label.clone();
+                    let pref_window_weak = pref_window.downgrade();
+                    row.connect_activated(move |_| {
+                        let Some(pw) = pref_window_weak.upgrade() else { return };
+                        capture_shortcut(pw.upcast_ref::<gtk::Window>(), action, &shortcuts, &key_label);
+                    });
+                }
+
+                sc_group.add(&row);
+                row_labels.push((action, key_label));
+            }
+
+            {
+                let shortcuts = shortcuts.clone();
+                reset_btn.connect_clicked(move |_| {
+                    shortcuts.reset_to_defaults();
+                    for (action, label) in &row_labels {
+                        if let Some(s) = shortcuts.get(*action) {
+                            label.set_text(&s.label());
+                        }
+                    }
+                });
+            }
+
+            let shortcuts_page = adw::PreferencesPage::builder()
+                .title("Shortcuts")
+                .icon_name("input-keyboard-symbolic")
+                .build();
+            shortcuts_page.add(&sc_group);
+
+            // === Subtitles + Mouse pages ===
+            let subtitles_page =
+                build_subtitles_page(&subs_prefs, &subtitle_css_prefs, &subtitle_label_prefs);
+            let mouse_page = build_mouse_page(&state_mouse);
+
+            pref_window.add(&general_page);
+            pref_window.add(&subtitles_page);
+            pref_window.add(&shortcuts_page);
+            pref_window.add(&mouse_page);
+            pref_window.present();
+        });
+    }
+
+    // ---------- Empty-state actions ----------
+    {
+        let open_btn = ui.open_btn.clone();
+        ui.action_open.connect_clicked(move |_| open_btn.emit_clicked());
+    }
+    {
+        let link_btn = ui.link_btn.clone();
+        ui.action_url.connect_clicked(move |_| link_btn.emit_clicked());
+    }
+
+    // ---------- Drag-and-drop ----------
+    // A dropped subtitle file loads onto the current video; anything else is
+    // treated as a media file to play.
+    {
+        let drop_target = gtk::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
+        let load_file = load_file.clone();
+        let drop_pipeline = pipeline.clone();
+        let drop_state = state.clone();
+        let drop_osd = ui.osd.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Ok(file) = value.get::<gio::File>() else {
+                return false;
+            };
+            // Subtitle → load onto current video.
+            if is_subtitle_uri(&file.uri()) {
+                load_subtitle(&drop_pipeline, &drop_state, &drop_osd, &file);
+                return true;
+            }
+            // Video file (by extension) → play it. Anything else (images,
+            // docs, …) is rejected instead of reloading the current video.
+            let is_video = file
+                .path()
+                .map(|p| is_video_path(&p))
+                .unwrap_or(true); // non-local URI: let playbin try
+            if is_video {
+                load_file(&file);
+            } else {
+                drop_osd.show("dialog-warning-symbolic", "Unsupported file type");
+            }
+            true
+        });
+        ui.window.add_controller(drop_target);
+    }
+
+    // ---------- Auto-resize window to video aspect ratio ----------
+    {
+        let window_weak = ui.window.downgrade();
+        pipe.paintable.connect_invalidate_size(move |p| {
+            let Some(window) = window_weak.upgrade() else { return };
+            if window.is_fullscreen() || window.is_maximized() {
+                return;
+            }
+            let vw = p.intrinsic_width();
+            let vh = p.intrinsic_height();
+            if vw <= 0 || vh <= 0 {
+                return;
+            }
+            let (mut max_w, mut max_h) = (1280, 800);
+            if let Some(surface) = window.surface()
+                && let Some(monitor) = gdk::Display::default()
+                    .and_then(|d| d.monitor_at_surface(&surface))
+            {
+                let geom = monitor.geometry();
+                max_w = (geom.width() as f64 * 0.85) as i32;
+                max_h = (geom.height() as f64 * 0.85) as i32;
+            }
+            let (video_w, video_h) = if vw * max_h > vh * max_w {
+                (max_w, (max_w as i64 * vh as i64 / vw as i64) as i32)
+            } else {
+                ((max_h as i64 * vw as i64 / vh as i64) as i32, max_h)
+            };
+            let target_w = video_w.max(360);
+            let target_h = video_h.max(280);
+            window.set_default_size(target_w, target_h);
+        });
+    }
+
+    // ---------- Play / pause ----------
+    {
+        let pipeline = pipeline.clone();
+        let user_paused = state.user_paused.clone();
+        let osd = ui.osd.clone();
+        ui.play_btn.connect_clicked(move |btn| {
+            let showing_pause = btn
+                .icon_name()
+                .map(|s| s == "media-playback-pause-symbolic")
+                .unwrap_or(false);
+            if showing_pause {
+                user_paused.set(true);
+                pipeline.set_state(gst::State::Paused).ok();
+                btn.set_icon_name("media-playback-start-symbolic");
+                osd.show("media-playback-pause-symbolic", "Paused");
+            } else {
+                osd.show("media-playback-start-symbolic", "Playing");
+                user_paused.set(false);
+                if let (Some(pos), Some(dur)) = (
+                    pipeline.query_position::<gst::ClockTime>(),
+                    pipeline.query_duration::<gst::ClockTime>(),
+                ) && dur.nseconds() > 0
+                    && pos.nseconds() + 500_000_000 >= dur.nseconds()
+                {
+                    pipeline
+                        .seek_simple(
+                            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                            gst::ClockTime::ZERO,
+                        )
+                        .ok();
+                }
+                pipeline.set_state(gst::State::Playing).ok();
+                btn.set_icon_name("media-playback-pause-symbolic");
+            }
+        });
+    }
+
+    // ---------- Stop (rewind to first frame + pause) ----------
+    {
+        let pipeline = pipeline.clone();
+        let play_btn = ui.play_btn.clone();
+        let user_paused = state.user_paused.clone();
+        let osd = ui.osd.clone();
+        ui.stop_btn.connect_clicked(move |_| {
+            user_paused.set(true);
+            // Pause first, then flush-seek to the start so the head frame is
+            // shown rather than continuing to play from zero.
+            pipeline.set_state(gst::State::Paused).ok();
+            pipeline
+                .seek_simple(
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                    gst::ClockTime::ZERO,
+                )
+                .ok();
+            play_btn.set_icon_name("media-playback-start-symbolic");
+            osd.show("media-playback-stop-symbolic", "Stopped");
+        });
+    }
+
+    // ---------- Volume + click-to-mute ----------
+    let last_volume = Rc::new(Cell::new(1.0_f64));
+    // Suppresses the volume OSD for the one-shot startup restore below.
+    let suppress_volume_osd = Rc::new(Cell::new(false));
+    {
+        let pipeline = pipeline.clone();
+        let volume_btn = ui.volume_btn.clone();
+        let last_volume = last_volume.clone();
+        let state_volume = state.volume.clone();
+        let osd = ui.osd.clone();
+        let suppress_volume_osd = suppress_volume_osd.clone();
+        ui.volume_scale.connect_value_changed(move |scale| {
+            let v = scale.value();
+            pipeline.set_property("volume", v);
+            state_volume.set(v); // mirror for persistence
+            if v > 0.001 {
+                last_volume.set(v);
+            }
+            let icon = if v <= 0.001 {
+                "audio-volume-muted-symbolic"
+            } else if v < 0.34 {
+                "audio-volume-low-symbolic"
+            } else if v < 0.67 {
+                "audio-volume-medium-symbolic"
+            } else {
+                "audio-volume-high-symbolic"
+            };
+            volume_btn.set_icon_name(icon);
+            // Skip the OSD for the initial restore (don't pop a toast on a
+            // fresh launch showing the welcome screen).
+            if suppress_volume_osd.replace(false) {
+                return;
+            }
+            if v <= 0.001 {
+                osd.show("audio-volume-muted-symbolic", "Muted");
+            } else {
+                osd.show(
+                    icon,
+                    &format!("Volume {}%", (v * 100.0).round() as i32),
+                );
+            }
+        });
+    }
+    {
+        let volume_scale = ui.volume_scale.clone();
+        let last_volume = last_volume.clone();
+        ui.volume_btn.connect_clicked(move |_| {
+            let current = volume_scale.value();
+            if current > 0.001 {
+                volume_scale.set_value(0.0);
+            } else {
+                volume_scale.set_value(last_volume.get().max(0.1));
+            }
+        });
+    }
+
+    // ---------- Volume reveal-on-hover ----------
+    {
+        let revealer_in = ui.volume_revealer.clone();
+        let revealer_out = ui.volume_revealer.clone();
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_enter(move |_, _, _| revealer_in.set_reveal_child(true));
+        motion.connect_leave(move |_| revealer_out.set_reveal_child(false));
+        ui.volume_box.add_controller(motion);
+    }
+
+    // ---------- Fullscreen ----------
+    {
+        let window_weak = ui.window.downgrade();
+        ui.fullscreen_btn.connect_clicked(move |btn| {
+            let Some(window) = window_weak.upgrade() else { return };
+            if window.is_fullscreen() {
+                window.unfullscreen();
+                btn.set_icon_name("view-fullscreen-symbolic");
+            } else {
+                window.fullscreen();
+                btn.set_icon_name("view-restore-symbolic");
+            }
+        });
+    }
+
+    // ---------- Seek (user-initiated) ----------
+    // Coalesced through AppState::request_seek - only one flush-seek in flight
+    // at a time, so mad scrubbing can't flood (and wedge) the HW decoder.
+    {
+        let pipeline = pipeline.clone();
+        let state = state.clone();
+        ui.seek_scale.connect_change_value(move |_, _, value| {
+            if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
+                let v = value.clamp(0.0, 1.0);
+                let target_ns = (v * dur.nseconds() as f64) as u64;
+                state.request_seek(&pipeline, target_ns);
+            }
+            Propagation::Proceed
+        });
+    }
+
+    // ---------- Periodic timer ----------
+    install_timer(ui, pipe, state);
+
+    // ---------- Bus watcher ----------
+    let bus_watch = install_bus_watch(ui, pipe, state, navigate.clone());
+
+    // ---------- Keyboard shortcuts ----------
+    install_keyboard(ui, pipe, state);
+
+    // ---------- Window control buttons ----------
+    {
+        let window_weak = ui.window.downgrade();
+        ui.minimize_btn.connect_clicked(move |_| {
+            if let Some(w) = window_weak.upgrade() {
+                w.minimize();
+            }
+        });
+    }
+    {
+        let window_weak = ui.window.downgrade();
+        ui.maximize_btn.connect_clicked(move |btn| {
+            let Some(w) = window_weak.upgrade() else { return };
+            if w.is_maximized() {
+                w.unmaximize();
+                btn.set_icon_name("window-maximize-symbolic");
+            } else {
+                w.maximize();
+                btn.set_icon_name("window-restore-symbolic");
+            }
+        });
+    }
+    {
+        let window_weak = ui.window.downgrade();
+        ui.close_btn.connect_clicked(move |_| {
+            if let Some(w) = window_weak.upgrade() {
+                w.close();
+            }
+        });
+    }
+
+    // ---------- Mouse: single / double click ----------
+    install_mouse_clicks(ui, pipe, state);
+
+    // ---------- Scroll over the video adjusts volume ----------
+    {
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::VERTICAL,
+        );
+        let volume_scale = ui.volume_scale.clone();
+        scroll.connect_scroll(move |_, _dx, dy| {
+            // dy < 0 = scroll up = louder; dy > 0 = scroll down = quieter.
+            let step = 0.05;
+            let v = (volume_scale.value() - dy * step).clamp(0.0, 1.0);
+            volume_scale.set_value(v); // updates pipeline + OSD via its handler
+            Propagation::Stop
+        });
+        ui.picture.add_controller(scroll);
+    }
+
+    // ---------- Right-click context menu ----------
+    install_context_menu(ui);
+
+    // ---------- Auto-hide chrome + draggable control bar ----------
+    install_overlay_chrome(ui);
+
+    // ---------- Subtitles ----------
+    install_subtitles(ui, pipe, state);
+    // Apply the initial subtitle style to the label so it's styled from the
+    // first cue (and reflects any persisted preferences).
+    apply_subtitle_style(&state.subtitles, &ui.subtitle_css, &ui.subtitle_label);
+
+    // Restore the persisted volume onto the slider (its value-changed handler
+    // applies it to the pipeline and updates the icon). Suppress the OSD for
+    // this one - we don't want a volume toast on a fresh launch.
+    suppress_volume_osd.set(true);
+    ui.volume_scale.set_value(state.volume.get());
+    suppress_volume_osd.set(false);
+
+    // ---------- Clean shutdown ----------
+    {
+        let pipeline = pipeline.clone();
+        let save_state = state.clone();
+        ui.window.connect_close_request(move |_| {
+            crate::config::save(&save_state); // persist settings
+            pipeline.set_state(gst::State::Null).ok();
+            let _ = &bus_watch; // keep the bus watch guard alive until the window dies
+            Propagation::Proceed
+        });
+    }
+
+    load_file
+}
+
+fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    let pipeline = pipe.pipeline.clone();
+    let seek_scale = ui.seek_scale.clone();
+    let position_label = ui.position_label.clone();
+    let duration_label = ui.duration_label.clone();
+    let play_btn = ui.play_btn.clone();
+    let debug_label = ui.debug_label.clone();
+    let queue_ref = state.queue_ref.clone();
+    let source_ref = state.source_ref.clone();
+    let stall_state = state.stall_state.clone();
+    let dl_state = state.dl_state.clone();
+    let user_paused = state.user_paused.clone();
+    let is_local = state.is_local.clone();
+    let show_debug = state.show_debug.clone();
+    let last_user_seek = state.last_user_seek.clone();
+    let pending_restore_pos = state.pending_restore_pos.clone();
+    let consecutive_stalls = state.consecutive_stalls.clone();
+    let state_for_drag = state.clone();
+    let subtitles = state.subtitles.clone();
+    let subtitle_label = ui.subtitle_label.clone();
+
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let (_, gst_state, _) = pipeline.state(gst::ClockTime::ZERO);
+        let expected_icon = if gst_state == gst::State::Playing {
+            "media-playback-pause-symbolic"
+        } else {
+            "media-playback-start-symbolic"
+        };
+        if play_btn.icon_name().as_deref() != Some(expected_icon)
+            && (gst_state == gst::State::Playing || gst_state == gst::State::Paused)
+        {
+            play_btn.set_icon_name(expected_icon);
+        }
+
+        let pos = pipeline.query_position::<gst::ClockTime>();
+        let dur = pipeline.query_duration::<gst::ClockTime>();
+
+        let queue_bytes_now: u64 = queue_ref
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref().and_then(|q| {
+                    if q.has_property("current-level-bytes", None) {
+                        Some(q.property::<u32>("current-level-bytes") as u64)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0);
+
+        let downloaded_bytes: u64 = {
+            let mut bq = gst::query::Buffering::new(gst::Format::Bytes);
+            if pipeline.query(bq.query_mut()) {
+                let (_s, stop, _t) = bq.range();
+                if let gst::GenericFormattedValue::Bytes(Some(b)) = stop {
+                    *b
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+        let total_bytes_src: u64 = source_ref
+            .lock()
+            .ok()
+            .and_then(|s| {
+                s.as_ref()
+                    .and_then(|e| e.query_duration::<gst::format::Bytes>())
+            })
+            .map(|b| *b)
+            .unwrap_or(0);
+        let still_more_to_download =
+            total_bytes_src > 0 && downloaded_bytes + 1024 * 1024 < total_bytes_src;
+
+        let pos_ns = pos.map(|p| p.nseconds()).unwrap_or(0);
+        // Grace after a seek: long enough for normal HW-decoder seek latency,
+        // short enough that a real post-seek freeze recovers quickly.
+        let recent_seek = last_user_seek.get().elapsed() < std::time::Duration::from_millis(1800);
+
+        if !state_for_drag.is_dragging_now() && !recent_seek && pos_ns > 0 {
+            let stuck_playing = gst_state == gst::State::Playing && pos_ns == stall_state.get().0;
+            let stuck_paused = gst_state == gst::State::Paused
+                && queue_bytes_now == 0
+                && !user_paused.get();
+
+            if stuck_playing || stuck_paused {
+                let (last, ticks) = stall_state.get();
+                let new_ticks = ticks + 1;
+                // 2 ticks * 100ms = 200ms of stall detection.
+                if new_ticks >= 2 {
+                    // Unified recovery: pause/resume first try, Ready→Playing
+                    // cycle on the second same-pos try. NEVER do a flushing
+                    // seek - it snaps to keyframes and jumps the visible
+                    // position backward by 5–10s, looping the user backward
+                    // through the movie.
+                    let (last_pos, count) = consecutive_stalls.get();
+                    let new_count = if last_pos == pos_ns { count + 1 } else { 1 };
+                    consecutive_stalls.set((pos_ns, new_count));
+
+                    if new_count >= 2 {
+                        eprintln!(
+                            "[watchdog] persistent stall at {pos_ns}ns q={}MB \u{2014} ready-cycle",
+                            queue_bytes_now / (1024 * 1024)
+                        );
+                        pending_restore_pos.set(Some(pos_ns));
+                        pipeline.set_state(gst::State::Ready).ok();
+                        let pl = pipeline.clone();
+                        glib::idle_add_local(move || {
+                            pl.set_state(gst::State::Playing).ok();
+                            ControlFlow::Break
+                        });
+                        consecutive_stalls.set((0, 0));
+                    } else {
+                        eprintln!(
+                            "[watchdog] stall at {pos_ns}ns q={}MB \u{2014} pause/resume",
+                            queue_bytes_now / (1024 * 1024)
+                        );
+                        pipeline.set_state(gst::State::Paused).ok();
+                        let pl = pipeline.clone();
+                        glib::idle_add_local(move || {
+                            pl.set_state(gst::State::Playing).ok();
+                            ControlFlow::Break
+                        });
+                    }
+                    last_user_seek.set(std::time::Instant::now());
+                    stall_state.set((pos_ns, 0));
+                } else {
+                    stall_state.set((last, new_ticks));
+                }
+            } else {
+                stall_state.set((pos_ns, 0));
+                consecutive_stalls.set((0, 0));
+            }
+        }
+
+        if let Some(p) = pos {
+            position_label.set_text(&format_time(p));
+
+            // Render the active external-subtitle cue (if any) in our label.
+            match subtitles.active_cue_text(p.nseconds()) {
+                Some(text) => {
+                    if subtitle_label.text() != text {
+                        subtitle_label.set_text(&text);
+                    }
+                    if !subtitle_label.is_visible() {
+                        subtitle_label.set_visible(true);
+                    }
+                }
+                None => {
+                    if subtitle_label.is_visible() {
+                        subtitle_label.set_visible(false);
+                    }
+                }
+            }
+        }
+        if let Some(d) = dur
+            && d.nseconds() > 0
+        {
+            duration_label.set_text(&format_time(d));
+        }
+        if let (Some(p), Some(d)) = (pos, dur)
+            && d.nseconds() > 0
+        {
+            if !state_for_drag.is_dragging_now() {
+                seek_scale.set_value(p.nseconds() as f64 / d.nseconds() as f64);
+            }
+
+            let fill = compute_fill(&pipeline, &queue_ref, &source_ref, &is_local, p, d);
+            seek_scale.set_fill_level(fill);
+
+            if show_debug.get() {
+                let now = std::time::Instant::now();
+                let (last_t, last_b) = dl_state.get();
+                let dt = now.duration_since(last_t).as_secs_f64().max(0.001);
+                let speed_bps = if queue_bytes_now >= last_b {
+                    (queue_bytes_now - last_b) as f64 / dt
+                } else {
+                    0.0
+                };
+                dl_state.set((now, queue_bytes_now));
+                let mb = |b: u64| (b as f64) / (1024.0 * 1024.0);
+                debug_label.set_text(&format!(
+                    "pos {} | q {:.1} MiB | net {:.1} MiB/s | fill {:.1}% | state {:?} u_paused {}",
+                    format_time(p),
+                    mb(queue_bytes_now),
+                    speed_bps / (1024.0 * 1024.0),
+                    fill * 100.0,
+                    gst_state,
+                    user_paused.get(),
+                ));
+            }
+        }
+        ControlFlow::Continue
+    });
+}
+
+fn compute_fill(
+    pipeline: &gst::Element,
+    queue_ref: &Arc<Mutex<Option<gst::Element>>>,
+    source_ref: &Arc<Mutex<Option<gst::Element>>>,
+    is_local: &Rc<Cell<bool>>,
+    p: gst::ClockTime,
+    d: gst::ClockTime,
+) -> f64 {
+    if is_local.get() {
+        return 1.0;
+    }
+    let queue_bytes: u64 = queue_ref
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref().and_then(|q| {
+                if q.has_property("current-level-bytes", None) {
+                    Some(q.property::<u32>("current-level-bytes") as u64)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(0);
+    let try_bytes = |slot: &Arc<Mutex<Option<gst::Element>>>| -> u64 {
+        slot.lock()
+            .ok()
+            .and_then(|s| {
+                s.as_ref()
+                    .and_then(|e| e.query_duration::<gst::format::Bytes>())
+            })
+            .map(|b| *b)
+            .unwrap_or(0)
+    };
+    let total_bytes = {
+        let t1 = try_bytes(source_ref);
+        if t1 == 0 { try_bytes(queue_ref) } else { t1 }
+    };
+    let mut dl_bytes: u64 = 0;
+    let mut bq = gst::query::Buffering::new(gst::Format::Bytes);
+    if pipeline.query(bq.query_mut()) {
+        let (_s, stop, _t) = bq.range();
+        if let gst::GenericFormattedValue::Bytes(Some(b)) = stop {
+            dl_bytes = *b;
+        }
+    }
+    if total_bytes > 0 {
+        let pos_fraction = p.nseconds() as f64 / d.nseconds() as f64;
+        let queue_fraction = queue_bytes as f64 / total_bytes as f64;
+        let dl_fraction = dl_bytes as f64 / total_bytes as f64;
+        (pos_fraction + queue_fraction).max(dl_fraction).clamp(0.0, 1.0)
+    } else {
+        (p.nseconds() as f64 / d.nseconds() as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn install_bus_watch(
+    ui: &UiHandles,
+    pipe: &PipelineHandles,
+    state: &AppState,
+    navigate: Rc<dyn Fn(i32)>,
+) -> gst::bus::BusWatchGuard {
+    let bus = pipe.pipeline.bus().expect("Pipeline has no bus");
+    let pipeline = pipe.pipeline.clone();
+    let play_btn = ui.play_btn.clone();
+    let buffer_chip = ui.buffer_chip.clone();
+    let toast_overlay = ui.toast_overlay.clone();
+    let pending_restore_pos = state.pending_restore_pos.clone();
+    let state_for_bus = state.clone();
+    bus.add_watch_local(move |_, msg| {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::AsyncDone(_) => {
+                // After a watchdog-driven hard reload, seek back to where we
+                // were so the user sees no jump.
+                if let Some(target_ns) = pending_restore_pos.take() {
+                    eprintln!("[watchdog] hard-reload complete \u{2014} seeking to {target_ns}ns");
+                    pipeline
+                        .seek_simple(
+                            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                            gst::ClockTime::from_nseconds(target_ns),
+                        )
+                        .ok();
+                } else {
+                    // A user/keyboard seek just finished - issue the next
+                    // coalesced one if the user kept scrubbing, else go idle.
+                    state_for_bus.on_seek_done(&pipeline);
+                }
+            }
+            MessageView::Eos(_) => {
+                // Auto-advance to the next file in the folder. navigate(1) is a
+                // no-op at the last file, so playback simply stops there.
+                let at_last = {
+                    let list = state_for_bus.playlist.borrow();
+                    list.is_empty()
+                        || state_for_bus.playlist_idx.get() + 1 >= list.len()
+                };
+                if at_last {
+                    pipeline.set_state(gst::State::Paused).ok();
+                    play_btn.set_icon_name("media-playback-start-symbolic");
+                } else {
+                    navigate(1);
+                }
+            }
+            MessageView::Buffering(_) => {
+                buffer_chip.set_visible(false);
+            }
+            MessageView::Error(err) => {
+                let src = err
+                    .src()
+                    .map(|s| s.path_string().to_string())
+                    .unwrap_or_else(|| "pipeline".into());
+                let msg = err.error().to_string();
+                eprintln!("GStreamer error from {src}: {msg} ({:?})", err.debug());
+
+                // Errors from the subtitle source bin (the suburi path) are
+                // non-fatal - playbin3 emits a spurious not-linked during its
+                // stream reconfiguration. Don't kill the movie or toast for
+                // those; only surface errors from the main playback path.
+                let is_subtitle_path =
+                    src.contains("urisourcebin1") || src.contains("suburidecodebin");
+                if !is_subtitle_path {
+                    // Map cryptic GStreamer errors to a human message.
+                    let low = msg.to_lowercase();
+                    let friendly = if low.contains("resolve")
+                        || low.contains("not found")
+                        || low.contains("could not open resource")
+                        || low.contains("connect")
+                    {
+                        "Couldn't open that link - check the address or your connection."
+                    } else if low.contains("internal data stream")
+                        || low.contains("not-linked")
+                        || low.contains("decode")
+                    {
+                        "Couldn't play this - the file or stream isn't a supported video."
+                    } else {
+                        "Couldn't play this file or stream."
+                    };
+                    let toast = adw::Toast::builder().title(friendly).timeout(5).build();
+                    toast_overlay.add_toast(toast);
+                    // Don't tear the pipeline down - a teardown loses playback
+                    // entirely. Leave it; the user can reopen if truly broken.
+                    play_btn.set_icon_name("media-playback-start-symbolic");
+                }
+            }
+            MessageView::Warning(w) => {
+                eprintln!(
+                    "GStreamer warning from {:?}: {} ({:?})",
+                    w.src().map(|s| s.path_string()),
+                    w.error(),
+                    w.debug()
+                );
+            }
+            MessageView::StateChanged(s) => {
+                if s.src()
+                    .map(|src| src.path_string().ends_with("playbin3-0"))
+                    .unwrap_or(false)
+                    && s.old() != s.current()
+                {
+                    eprintln!("[state] {:?} \u{2192} {:?}", s.old(), s.current());
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue
+    })
+    .expect("Failed to add bus watch")
+}
+
+/// Auto-hide the top bar + control bar after mouse inactivity (revealing them
+/// on motion), and make the control bar draggable around the screen.
+fn install_overlay_chrome(ui: &UiHandles) {
+    let controls = ui.controls.clone();
+    let top_bar = ui.top_bar.clone();
+    let window = ui.window.clone();
+
+    // Debounce token for the hide timer.
+    let hide_token = Rc::new(Cell::new(0u64));
+
+    let show_chrome = {
+        let controls = controls.clone();
+        let top_bar = top_bar.clone();
+        let window = window.clone();
+        move || {
+            controls.remove_css_class("autohide-hidden");
+            top_bar.remove_css_class("autohide-hidden");
+            controls.set_can_target(true);
+            top_bar.set_can_target(true);
+            window.set_cursor(None); // restore default cursor
+        }
+    };
+    let hide_chrome = {
+        let controls = controls.clone();
+        let top_bar = top_bar.clone();
+        let window = window.clone();
+        move || {
+            // Always hide the panels, regardless of pointer position.
+            controls.add_css_class("autohide-hidden");
+            top_bar.add_css_class("autohide-hidden");
+            controls.set_can_target(false);
+            top_bar.set_can_target(false);
+            // Hide the cursor only in fullscreen (immersive); keep it in
+            // windowed mode so the user can still see/use it.
+            if window.is_fullscreen() {
+                window.set_cursor(gdk::Cursor::from_name("none", None).as_ref());
+            } else {
+                window.set_cursor(None);
+            }
+        }
+    };
+
+    // Reset: reveal chrome and schedule a hide ~2.5s later. Hiding is purely
+    // time-based - it no longer matters where the pointer is.
+    let bump = {
+        let show_chrome = show_chrome.clone();
+        let hide_chrome = hide_chrome.clone();
+        let hide_token = hide_token.clone();
+        move || {
+            show_chrome();
+            let token = hide_token.get().wrapping_add(1);
+            hide_token.set(token);
+            let hide_chrome = hide_chrome.clone();
+            let hide_token = hide_token.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(2500), move || {
+                if hide_token.get() == token {
+                    hide_chrome();
+                }
+                ControlFlow::Break
+            });
+        }
+    };
+
+    // Reveal on *real* pointer motion; the timer hides again. We compare the
+    // pointer position to the last one and ignore zero-movement events -
+    // crucially, hiding the bar (can-target=false) makes the pointer "fall
+    // through" to the video, which emits a synthetic same-position motion
+    // event that would otherwise instantly re-show the panels (the bug where
+    // they never hid while the mouse was inside the window).
+    {
+        let motion = gtk::EventControllerMotion::new();
+        let bump = bump.clone();
+        let last_pos = Rc::new(Cell::new((f64::NAN, f64::NAN)));
+        motion.connect_motion(move |_, x, y| {
+            let (lx, ly) = last_pos.get();
+            if !(lx == x && ly == y) {
+                last_pos.set((x, y));
+                bump();
+            }
+        });
+        ui.window.add_controller(motion);
+    }
+
+    // Draggable control bar. The gesture lives on the STATIONARY overlay (not
+    // the moving bar) so its coordinates don't drift as the bar moves. We only
+    // grab when the press started over the bar; otherwise we deny the gesture
+    // so video clicks aren't affected.
+    if let Some(overlay) = ui.controls.parent() {
+        let drag = gtk::GestureDrag::new();
+        // grab = pointer offset from the bar's top-left at drag start.
+        let grab = Rc::new(Cell::new(None::<(f64, f64)>));
+        let controls = ui.controls.clone();
+        {
+            let grab = grab.clone();
+            let controls = controls.clone();
+            drag.connect_drag_begin(move |g, x, y| {
+                let a = controls.allocation();
+                let inside = x >= a.x() as f64
+                    && x <= (a.x() + a.width()) as f64
+                    && y >= a.y() as f64
+                    && y <= (a.y() + a.height()) as f64;
+                if inside {
+                    grab.set(Some((x - a.x() as f64, y - a.y() as f64)));
+                } else {
+                    grab.set(None);
+                    g.set_state(gtk::EventSequenceState::Denied);
+                }
+            });
+        }
+        {
+            let grab = grab.clone();
+            let controls = controls.clone();
+            drag.connect_drag_update(move |g, off_x, off_y| {
+                let Some((gx, gy)) = grab.get() else { return };
+                let Some((sx, sy)) = g.start_point() else { return };
+                // Current pointer position in stationary overlay coords.
+                let px = sx + off_x;
+                let py = sy + off_y;
+                let mut nx = (px - gx) as i32;
+                let mut ny = (py - gy) as i32;
+                // Switch to absolute positioning on first move.
+                controls.set_halign(gtk::Align::Start);
+                controls.set_valign(gtk::Align::Start);
+                controls.set_margin_bottom(0);
+                if let Some(parent) = controls.parent() {
+                    const INSET: i32 = 10; // keep a margin from the window edges
+                    let max_x = (parent.width() - controls.width() - INSET).max(INSET);
+                    let max_y = (parent.height() - controls.height() - INSET).max(INSET);
+                    nx = nx.clamp(INSET, max_x);
+                    ny = ny.clamp(INSET, max_y);
+                }
+                controls.set_margin_start(nx);
+                controls.set_margin_top(ny);
+            });
+        }
+        overlay.add_controller(drag);
+    }
+
+    // Keep the (dragged) bar inside the overlay after any resize / fullscreen.
+    // A cheap periodic re-clamp covers every resize path without needing
+    // size-allocate signals.
+    {
+        let controls = ui.controls.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            // Only when in dragged/absolute mode (halign switched to Start).
+            if controls.halign() == gtk::Align::Start
+                && let Some(parent) = controls.parent()
+            {
+                const INSET: i32 = 10;
+                let cw = controls.width();
+                let ch = controls.height();
+                // If the bar no longer fits the window, snap back to the
+                // default centered-bottom position so it can't overflow.
+                if cw + 2 * INSET > parent.width() || ch + 2 * INSET > parent.height() {
+                    controls.set_halign(gtk::Align::Center);
+                    controls.set_valign(gtk::Align::End);
+                    controls.set_margin_start(0);
+                    controls.set_margin_top(0);
+                    controls.set_margin_bottom(28);
+                } else {
+                    let max_x = (parent.width() - cw - INSET).max(INSET);
+                    let max_y = (parent.height() - ch - INSET).max(INSET);
+                    let nx = controls.margin_start().clamp(INSET, max_x);
+                    let ny = controls.margin_top().clamp(INSET, max_y);
+                    if nx != controls.margin_start() {
+                        controls.set_margin_start(nx);
+                    }
+                    if ny != controls.margin_top() {
+                        controls.set_margin_top(ny);
+                    }
+                }
+            }
+            ControlFlow::Continue
+        });
+    }
+
+    // Reveal initially.
+    bump();
+}
+
+/// Video file extensions we treat as playable for folder navigation.
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "webm", "m4v", "wmv", "flv", "mpeg", "mpg",
+    "ts", "m2ts", "mts", "ogv", "3gp", "vob",
+];
+
+fn is_video_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Scan the folder of `path` for video files, sorted by name (case-insensitive).
+/// Returns the sorted list and the index of `path` within it.
+fn scan_playlist(path: &std::path::Path) -> (Vec<std::path::PathBuf>, usize) {
+    let Some(dir) = path.parent() else {
+        return (vec![path.to_path_buf()], 0);
+    };
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && is_video_path(p))
+            .collect(),
+        Err(_) => vec![path.to_path_buf()],
+    };
+    files.sort_by_key(|p| p.to_string_lossy().to_lowercase());
+    let idx = files.iter().position(|p| p == path).unwrap_or(0);
+    (files, idx)
+}
+
+/// Is this file a subtitle (by extension)? Used by the drop handler.
+fn is_subtitle_uri(uri: &str) -> bool {
+    let lower = uri.to_lowercase();
+    [".srt", ".ass", ".ssa", ".vtt", ".sub"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Read a subtitle file and return its text decoded to UTF-8 (handling
+/// Windows-1256 for Persian/Arabic), plus the display filename.
+fn read_subtitle_text(file: &gio::File) -> Option<(String, String)> {
+    let path = file.path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let without_bom = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let text = if let Ok(s) = std::str::from_utf8(without_bom) {
+        s.to_string()
+    } else {
+        let (cow, _enc, _err) = encoding_rs::WINDOWS_1256.decode(&bytes);
+        eprintln!("[subs] decoded subtitle as Windows-1256");
+        cow.into_owned()
+    };
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Subtitle".into());
+    Some((text, name))
+}
+
+/// Load an external subtitle file. We parse the SRT ourselves and render cues
+/// in a GTK label synced to the playback position (see the periodic timer) -
+/// playbin's own external-subtitle pipeline doesn't render reliably with our
+/// hardware-decode + GTK sink setup, so we bypass it entirely.
+fn load_subtitle(
+    pipeline: &gst::Element,
+    state: &AppState,
+    osd: &crate::osd::Osd,
+    file: &gio::File,
+) {
+    let Some((text, name)) = read_subtitle_text(file) else {
+        eprintln!("[subs] could not read subtitle file");
+        osd.show("dialog-warning-symbolic", "Couldn't read subtitle");
+        return;
+    };
+    osd.show(
+        "media-view-subtitles-symbolic",
+        &format!("Added subtitle: {name}"),
+    );
+    let idx = state.subtitles.add_external(&text, name);
+    state.subtitles.set_external(pipeline, idx);
+}
+
+/// A flat menu-row button: [check icon] [label].
+fn subtitle_menu_row(label: &str, active: bool) -> gtk::Button {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let check = gtk::Image::from_icon_name("object-select-symbolic");
+    check.set_size_request(16, 16);
+    check.set_opacity(if active { 1.0 } else { 0.0 });
+    row.append(&check);
+    let lbl = gtk::Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    lbl.set_hexpand(true);
+    row.append(&lbl);
+    let btn = gtk::Button::new();
+    btn.set_child(Some(&row));
+    btn.add_css_class("flat");
+    btn.add_css_class("context-menu-item");
+    btn.set_focus_on_click(false);
+    btn
+}
+
+/// Wire the subtitle button: a popover listing Off / available text tracks /
+/// "Add subtitle file…", rebuilt each time it opens.
+fn install_subtitles(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(&ui.subtitle_btn);
+    popover.add_css_class("menu");
+
+    let pipeline = pipe.pipeline.clone();
+    let subs = state.subtitles.clone();
+    let menu_state = state.clone();
+    let window_weak = ui.window.downgrade();
+    let sub_label = ui.subtitle_label.clone();
+    let osd = ui.osd.clone();
+
+    // Clear the on-screen subtitle immediately when switching tracks so the
+    // previous track's text doesn't linger until the next cue.
+    let clear_label = {
+        let sub_label = sub_label.clone();
+        move || {
+            sub_label.set_text("");
+            sub_label.set_visible(false);
+        }
+    };
+
+    ui.subtitle_btn.connect_clicked(move |_| {
+        use crate::subtitles::Active;
+        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        menu_box.add_css_class("context-menu");
+
+        let active = *subs.active.borrow();
+
+        // "Off"
+        let off_row = subtitle_menu_row("Off", active == Active::Off);
+        {
+            let subs = subs.clone();
+            let pipeline = pipeline.clone();
+            let popover = popover.clone();
+            let clear_label = clear_label.clone();
+            let osd = osd.clone();
+            off_row.connect_clicked(move |_| {
+                subs.set_off(&pipeline);
+                clear_label();
+                osd.show("media-view-subtitles-symbolic", "Subtitles off");
+                popover.popdown();
+            });
+        }
+        menu_box.append(&off_row);
+
+        // Embedded tracks (rendered by playbin).
+        for (index, label) in subs.embedded_tracks(&pipeline) {
+            let row = subtitle_menu_row(&label, active == Active::Embedded(index));
+            let subs = subs.clone();
+            let pipeline = pipeline.clone();
+            let popover = popover.clone();
+            let clear_label = clear_label.clone();
+            let osd = osd.clone();
+            let label_msg = label.clone();
+            row.connect_clicked(move |_| {
+                subs.set_embedded(&pipeline, index);
+                clear_label();
+                osd.show("media-view-subtitles-symbolic", &format!("Subtitle: {label_msg}"));
+                popover.popdown();
+            });
+            menu_box.append(&row);
+        }
+
+        // External subs loaded this session (rendered by our label).
+        for (i, ext) in subs.externals.borrow().iter().enumerate() {
+            let row = subtitle_menu_row(&ext.name, active == Active::External(i));
+            let subs = subs.clone();
+            let pipeline = pipeline.clone();
+            let popover = popover.clone();
+            let clear_label = clear_label.clone();
+            let osd = osd.clone();
+            let name_msg = ext.name.clone();
+            row.connect_clicked(move |_| {
+                subs.set_external(&pipeline, i);
+                clear_label();
+                osd.show("media-view-subtitles-symbolic", &format!("Subtitle: {name_msg}"));
+                popover.popdown();
+            });
+            menu_box.append(&row);
+        }
+
+        let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+        sep.set_margin_top(4);
+        sep.set_margin_bottom(4);
+        menu_box.append(&sep);
+
+        // "Add subtitle file…"
+        let add_row = subtitle_menu_row("Add subtitle file\u{2026}", false);
+        {
+            let window_weak = window_weak.clone();
+            let pipeline = pipeline.clone();
+            let popover = popover.clone();
+            let menu_state = menu_state.clone();
+            let osd = osd.clone();
+            add_row.connect_clicked(move |_| {
+                popover.popdown();
+                let Some(window) = window_weak.upgrade() else { return };
+                let filter = gtk::FileFilter::new();
+                filter.set_name(Some("Subtitle files"));
+                for p in ["*.srt", "*.ass", "*.ssa", "*.vtt", "*.sub"] {
+                    filter.add_pattern(p);
+                }
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                let dialog = gtk::FileDialog::builder()
+                    .title("Add Subtitle")
+                    .modal(true)
+                    .filters(&filters)
+                    .build();
+                let pipeline = pipeline.clone();
+                let menu_state = menu_state.clone();
+                let osd = osd.clone();
+                dialog.open(Some(&window), gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res {
+                        load_subtitle(&pipeline, &menu_state, &osd, &file);
+                    }
+                });
+            });
+        }
+        menu_box.append(&add_row);
+
+        popover.set_child(Some(&menu_box));
+        popover.popup();
+    });
+}
+
+/// gdk::RGBA (0..1 floats) → big-endian ARGB u32 (0xAARRGGBB) for textoverlay.
+fn rgba_to_argb(c: &gdk::RGBA) -> u32 {
+    let a = (c.alpha() * 255.0).round() as u32;
+    let r = (c.red() * 255.0).round() as u32;
+    let g = (c.green() * 255.0).round() as u32;
+    let b = (c.blue() * 255.0).round() as u32;
+    (a << 24) | (r << 16) | (g << 8) | b
+}
+
+/// Big-endian ARGB u32 → gdk::RGBA, for seeding the color buttons.
+fn argb_to_rgba(argb: u32) -> gdk::RGBA {
+    let a = ((argb >> 24) & 0xFF) as f32 / 255.0;
+    let r = ((argb >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((argb >> 8) & 0xFF) as f32 / 255.0;
+    let b = (argb & 0xFF) as f32 / 255.0;
+    gdk::RGBA::new(r, g, b, a)
+}
+
+/// Apply the subtitle style to our custom label: regenerate its CSS and set
+/// the vertical alignment + margins.
+fn apply_subtitle_style(
+    subs: &crate::subtitles::Subtitles,
+    css: &gtk::CssProvider,
+    label: &gtk::Label,
+) {
+    use crate::subtitles::VAlign;
+    let style = subs.style.lock().unwrap();
+    css.load_from_string(&crate::subtitles::subtitle_css(&style));
+    match style.valign {
+        VAlign::Bottom => {
+            label.set_valign(gtk::Align::End);
+            label.set_margin_bottom(96);
+            label.set_margin_top(0);
+        }
+        VAlign::Top => {
+            label.set_valign(gtk::Align::Start);
+            label.set_margin_top(60);
+            label.set_margin_bottom(0);
+        }
+        VAlign::Center => {
+            label.set_valign(gtk::Align::Center);
+            label.set_margin_top(0);
+            label.set_margin_bottom(0);
+        }
+    }
+}
+
+/// Build the "Subtitles" PreferencesPage. Each control updates the shared
+/// style and live-applies it to our subtitle label via `apply_subtitle_style`.
+fn build_subtitles_page(
+    subs: &crate::subtitles::Subtitles,
+    css: &gtk::CssProvider,
+    label: &gtk::Label,
+) -> adw::PreferencesPage {
+    use crate::subtitles::VAlign;
+
+    let group = adw::PreferencesGroup::builder().title("Subtitle style").build();
+    let apply = {
+        let subs = subs.clone();
+        let css = css.clone();
+        let label = label.clone();
+        move || apply_subtitle_style(&subs, &css, &label)
+    };
+
+    // --- Font ---
+    let font_row = adw::ActionRow::builder().title("Font").build();
+    let font_btn = gtk::FontDialogButton::new(Some(gtk::FontDialog::new()));
+    font_btn.set_valign(gtk::Align::Center);
+    font_btn.set_font_desc(&pango::FontDescription::from_string(
+        &subs.style.lock().unwrap().font_desc,
+    ));
+    font_row.add_suffix(&font_btn);
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        font_btn.connect_font_desc_notify(move |btn| {
+            if let Some(desc) = btn.font_desc() {
+                subs.style.lock().unwrap().font_desc = desc.to_str().to_string();
+                apply();
+            }
+        });
+    }
+    group.add(&font_row);
+
+    // --- Text color ---
+    let color_row = adw::ActionRow::builder().title("Text color").build();
+    let color_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    color_btn.set_valign(gtk::Align::Center);
+    color_btn.set_rgba(&argb_to_rgba(subs.style.lock().unwrap().color));
+    color_row.add_suffix(&color_btn);
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        color_btn.connect_rgba_notify(move |btn| {
+            subs.style.lock().unwrap().color = rgba_to_argb(&btn.rgba());
+            apply();
+        });
+    }
+    group.add(&color_row);
+
+    // --- Outline color ---
+    let outline_row = adw::ActionRow::builder().title("Outline color").build();
+    let outline_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    outline_btn.set_valign(gtk::Align::Center);
+    outline_btn.set_rgba(&argb_to_rgba(subs.style.lock().unwrap().outline_color));
+    outline_row.add_suffix(&outline_btn);
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        outline_btn.connect_rgba_notify(move |btn| {
+            subs.style.lock().unwrap().outline_color = rgba_to_argb(&btn.rgba());
+            apply();
+        });
+    }
+    group.add(&outline_row);
+
+    // --- Toggles ---
+    let outline_sw = adw::SwitchRow::builder()
+        .title("Draw outline")
+        .active(subs.style.lock().unwrap().draw_outline)
+        .build();
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        outline_sw.connect_active_notify(move |r| {
+            subs.style.lock().unwrap().draw_outline = r.is_active();
+            apply();
+        });
+    }
+    group.add(&outline_sw);
+
+    let shadow_sw = adw::SwitchRow::builder()
+        .title("Draw shadow")
+        .active(subs.style.lock().unwrap().draw_shadow)
+        .build();
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        shadow_sw.connect_active_notify(move |r| {
+            subs.style.lock().unwrap().draw_shadow = r.is_active();
+            apply();
+        });
+    }
+    group.add(&shadow_sw);
+
+    let bg_sw = adw::SwitchRow::builder()
+        .title("Shaded background")
+        .subtitle("Translucent box behind the text")
+        .active(subs.style.lock().unwrap().shaded_background)
+        .build();
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        bg_sw.connect_active_notify(move |r| {
+            subs.style.lock().unwrap().shaded_background = r.is_active();
+            apply();
+        });
+    }
+    group.add(&bg_sw);
+
+    // --- Vertical position ---
+    let pos_row = adw::ComboRow::builder()
+        .title("Position")
+        .model(&gtk::StringList::new(&["Bottom", "Top", "Center"]))
+        .selected(match subs.style.lock().unwrap().valign {
+            VAlign::Bottom => 0,
+            VAlign::Top => 1,
+            VAlign::Center => 2,
+        })
+        .build();
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        pos_row.connect_selected_notify(move |r| {
+            subs.style.lock().unwrap().valign = match r.selected() {
+                1 => VAlign::Top,
+                2 => VAlign::Center,
+                _ => VAlign::Bottom,
+            };
+            apply();
+        });
+    }
+    group.add(&pos_row);
+
+    let page = adw::PreferencesPage::builder()
+        .title("Subtitles")
+        .icon_name("media-view-subtitles-symbolic")
+        .build();
+    page.add(&group);
+    page
+}
+
+/// Build the "Mouse" PreferencesPage with two ComboRows for single/double
+/// click actions.
+fn build_mouse_page(mouse: &crate::shortcuts::MouseBindings) -> adw::PreferencesPage {
+    use crate::shortcuts::Action;
+
+    let actions = Action::all();
+    // Combo string list: index 0 = "None", then each action.
+    let make_strings = || {
+        let mut v: Vec<&str> = Vec::with_capacity(actions.len() + 1);
+        v.push("None");
+        for a in actions {
+            v.push(a.title());
+        }
+        v
+    };
+    let index_of = |action: Option<Action>| -> u32 {
+        match action {
+            None => 0,
+            Some(a) => actions
+                .iter()
+                .position(|x| *x == a)
+                .map(|i| (i + 1) as u32)
+                .unwrap_or(0),
+        }
+    };
+    let action_from_index = |idx: u32| -> Option<Action> {
+        if idx == 0 {
+            None
+        } else {
+            actions.get((idx - 1) as usize).copied()
+        }
+    };
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Mouse on video")
+        .description("Action performed when clicking on the video area")
+        .build();
+
+    let single_row = adw::ComboRow::builder()
+        .title("Single click")
+        .model(&gtk::StringList::new(&make_strings()))
+        .selected(index_of(mouse.single.get()))
+        .build();
+    {
+        let mouse = mouse.clone();
+        single_row.connect_selected_notify(move |row| {
+            mouse.single.set(action_from_index(row.selected()));
+        });
+    }
+
+    let double_row = adw::ComboRow::builder()
+        .title("Double click")
+        .model(&gtk::StringList::new(&make_strings()))
+        .selected(index_of(mouse.double.get()))
+        .build();
+    {
+        let mouse = mouse.clone();
+        double_row.connect_selected_notify(move |row| {
+            mouse.double.set(action_from_index(row.selected()));
+        });
+    }
+
+    group.add(&single_row);
+    group.add(&double_row);
+
+    let page = adw::PreferencesPage::builder()
+        .title("Mouse")
+        .icon_name("input-mouse-symbolic")
+        .build();
+    page.add(&group);
+    page
+}
+
+/// Run the configured single/double-click action against the player.
+fn install_mouse_clicks(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    // GestureClick reports n_press incrementing for repeated clicks within
+    // the system double-click time. We delay the single-click action by a
+    // short timeout so a double-click doesn't briefly fire the single-click
+    // action first.
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(1);
+
+    let pending_single: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+
+    let pipeline = pipe.pipeline.clone();
+    let play_btn = ui.play_btn.clone();
+    let fullscreen_btn = ui.fullscreen_btn.clone();
+    let open_btn = ui.open_btn.clone();
+    let link_btn = ui.link_btn.clone();
+    let volume_btn = ui.volume_btn.clone();
+    let volume_scale = ui.volume_scale.clone();
+    let next_btn = ui.next_btn.clone();
+    let prev_btn = ui.prev_btn.clone();
+    let osd = ui.osd.clone();
+    let last_user_seek = state.last_user_seek.clone();
+    let mouse = state.mouse.clone();
+
+    gesture.connect_pressed(move |_, n_press, _, _| {
+        if n_press == 1 {
+            // Tentatively schedule the single-click action.
+            let token = pending_single.get().wrapping_add(1);
+            pending_single.set(token);
+            let pending_single = pending_single.clone();
+            let pipeline = pipeline.clone();
+            let play_btn = play_btn.clone();
+            let fullscreen_btn = fullscreen_btn.clone();
+            let open_btn = open_btn.clone();
+            let link_btn = link_btn.clone();
+            let volume_btn = volume_btn.clone();
+            let volume_scale = volume_scale.clone();
+            let next_btn = next_btn.clone();
+            let prev_btn = prev_btn.clone();
+            let osd = osd.clone();
+            let last_user_seek = last_user_seek.clone();
+            let mouse = mouse.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(260), move || {
+                if pending_single.get() == token
+                    && let Some(action) = mouse.single.get()
+                {
+                    run_action(
+                        action,
+                        &pipeline,
+                        &play_btn,
+                        &fullscreen_btn,
+                        &open_btn,
+                        &link_btn,
+                        &volume_btn,
+                        &volume_scale,
+                        &next_btn,
+                        &prev_btn,
+                        &osd,
+                        &last_user_seek,
+                    );
+                }
+                ControlFlow::Break
+            });
+        } else if n_press == 2 {
+            // Cancel any pending single-click and fire double-click action.
+            pending_single.set(pending_single.get().wrapping_add(1));
+            if let Some(action) = mouse.double.get() {
+                run_action(
+                    action,
+                    &pipeline,
+                    &play_btn,
+                    &fullscreen_btn,
+                    &open_btn,
+                    &link_btn,
+                    &volume_btn,
+                    &volume_scale,
+                    &next_btn,
+                    &prev_btn,
+                    &osd,
+                    &last_user_seek,
+                );
+            }
+        }
+    });
+    ui.picture.add_controller(gesture);
+}
+
+/// Right-click anywhere on the player surface opens a small menu with
+/// Open file / Open URL / Preferences. We build it with custom buttons
+/// (instead of `gtk::PopoverMenu` + `gio::Menu`) because GTK4's menu model
+/// rendering doesn't show icons.
+fn install_context_menu(ui: &UiHandles) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(&ui.window);
+    popover.add_css_class("menu");
+
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    menu_box.add_css_class("context-menu");
+
+    // Build a single row: [icon] [label], styled as a flat button.
+    let make_row = |icon_name: &str, label: &str| -> gtk::Button {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.append(&gtk::Image::from_icon_name(icon_name));
+        let lbl = gtk::Label::new(Some(label));
+        lbl.set_xalign(0.0);
+        lbl.set_hexpand(true);
+        row.append(&lbl);
+        let btn = gtk::Button::new();
+        btn.set_child(Some(&row));
+        btn.add_css_class("flat");
+        btn.add_css_class("context-menu-item");
+        btn.set_focus_on_click(false);
+        btn
+    };
+
+    let open_item = make_row("document-open-symbolic", "Open File\u{2026}");
+    {
+        let popover_clone = popover.clone();
+        let open_btn = ui.open_btn.clone();
+        open_item.connect_clicked(move |_| {
+            popover_clone.popdown();
+            open_btn.emit_clicked();
+        });
+    }
+    let link_item = make_row("insert-link-symbolic", "Open URL\u{2026}");
+    {
+        let popover_clone = popover.clone();
+        let link_btn = ui.link_btn.clone();
+        link_item.connect_clicked(move |_| {
+            popover_clone.popdown();
+            link_btn.emit_clicked();
+        });
+    }
+    let prefs_item = make_row("emblem-system-symbolic", "Preferences\u{2026}");
+    {
+        let popover_clone = popover.clone();
+        let settings_btn = ui.settings_btn.clone();
+        prefs_item.connect_clicked(move |_| {
+            popover_clone.popdown();
+            settings_btn.emit_clicked();
+        });
+    }
+
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    separator.set_margin_top(4);
+    separator.set_margin_bottom(4);
+
+    menu_box.append(&open_item);
+    menu_box.append(&link_item);
+    menu_box.append(&separator);
+    menu_box.append(&prefs_item);
+    popover.set_child(Some(&menu_box));
+
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3); // right mouse button
+    let popover_clone = popover.clone();
+    right_click.connect_pressed(move |_, _n_press, x, y| {
+        popover_clone.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover_clone.popup();
+    });
+    ui.window.add_controller(right_click);
+}
+
+/// Open a small dialog that captures the next key the user presses and
+/// assigns it as the binding for `action`. Esc cancels.
+fn capture_shortcut(
+    parent: &gtk::Window,
+    action: Action,
+    shortcuts: &crate::shortcuts::Shortcuts,
+    row_label: &gtk::Label,
+) {
+    let hint = gtk::Label::new(Some("Press a key combination…\n(Esc to cancel)"));
+    hint.set_justify(gtk::Justification::Center);
+    hint.set_margin_top(8);
+    hint.set_margin_bottom(8);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Set shortcut: {}", action.title()))
+        .extra_child(&hint)
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+
+    let key_controller = gtk::EventControllerKey::new();
+    {
+        let shortcuts = shortcuts.clone();
+        let row_label = row_label.clone();
+        let dialog_weak = dialog.downgrade();
+        key_controller.connect_key_pressed(move |_, key, _, mods| {
+            // Ignore lone modifier presses - wait for the real key.
+            let is_modifier_only = matches!(
+                key,
+                gdk::Key::Control_L
+                    | gdk::Key::Control_R
+                    | gdk::Key::Shift_L
+                    | gdk::Key::Shift_R
+                    | gdk::Key::Alt_L
+                    | gdk::Key::Alt_R
+                    | gdk::Key::Super_L
+                    | gdk::Key::Super_R
+                    | gdk::Key::Meta_L
+                    | gdk::Key::Meta_R
+            );
+            if is_modifier_only {
+                return Propagation::Stop;
+            }
+            if key == gdk::Key::Escape {
+                if let Some(d) = dialog_weak.upgrade() {
+                    d.close();
+                }
+                return Propagation::Stop;
+            }
+            let sc = crate::shortcuts::Shortcut::from_event(key, mods);
+            shortcuts.set(action, sc);
+            row_label.set_text(&sc.label());
+            if let Some(d) = dialog_weak.upgrade() {
+                d.close();
+            }
+            Propagation::Stop
+        });
+    }
+    dialog.add_controller(key_controller);
+    dialog.present(Some(parent));
+}
+
+fn install_keyboard(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    let key_controller = gtk::EventControllerKey::new();
+    // Capture phase: we see keys before the focused widget does, so Space
+    // triggers Play/Pause even when a button happens to be focused (e.g.
+    // after a dialog closes and focus snaps back to the button that opened it).
+    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let play_btn = ui.play_btn.clone();
+    let fullscreen_btn = ui.fullscreen_btn.clone();
+    let open_btn = ui.open_btn.clone();
+    let link_btn = ui.link_btn.clone();
+    let volume_btn = ui.volume_btn.clone();
+    let volume_scale = ui.volume_scale.clone();
+    let next_btn = ui.next_btn.clone();
+    let prev_btn = ui.prev_btn.clone();
+    let osd = ui.osd.clone();
+    let pipeline = pipe.pipeline.clone();
+    let shortcuts = state.shortcuts.clone();
+    let last_user_seek = state.last_user_seek.clone();
+
+    key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        let Some(action) = shortcuts.lookup(key, modifiers) else {
+            return Propagation::Proceed;
+        };
+        run_action(
+            action,
+            &pipeline,
+            &play_btn,
+            &fullscreen_btn,
+            &open_btn,
+            &link_btn,
+            &volume_btn,
+            &volume_scale,
+            &next_btn,
+            &prev_btn,
+            &osd,
+            &last_user_seek,
+        );
+        Propagation::Stop
+    });
+    ui.window.add_controller(key_controller);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_action(
+    action: Action,
+    pipeline: &gst::Element,
+    play_btn: &gtk::Button,
+    fullscreen_btn: &gtk::Button,
+    open_btn: &gtk::Button,
+    link_btn: &gtk::Button,
+    volume_btn: &gtk::Button,
+    volume_scale: &gtk::Scale,
+    next_btn: &gtk::Button,
+    prev_btn: &gtk::Button,
+    osd: &crate::osd::Osd,
+    last_user_seek: &Rc<Cell<std::time::Instant>>,
+) {
+    // Two seek modes:
+    //   - precise: ACCURATE for ±N s arrow-key nudges (must land on the exact
+    //     time, even if it means decoding from the previous keyframe).
+    //   - snap: KEY_UNIT|SNAP_NEAREST for jumps (start/end), instant feel.
+    // Using SNAP_NEAREST for arrow nudges caused "forward doesn't work"
+    // (snapped to the keyframe behind target) and "backward random amount".
+    let seek_precise = |target: gst::ClockTime| {
+        last_user_seek.set(std::time::Instant::now());
+        pipeline
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, target)
+            .ok();
+    };
+    let seek_snap = |target: gst::ClockTime| {
+        last_user_seek.set(std::time::Instant::now());
+        pipeline
+            .seek_simple(
+                gst::SeekFlags::FLUSH
+                    | gst::SeekFlags::KEY_UNIT
+                    | gst::SeekFlags::SNAP_NEAREST,
+                target,
+            )
+            .ok();
+    };
+    let seek_relative = |delta_secs: i64| {
+        let Some(pos) = pipeline.query_position::<gst::ClockTime>() else { return };
+        let dur = pipeline.query_duration::<gst::ClockTime>();
+        let target_ns = if delta_secs >= 0 {
+            let bump = (delta_secs as u64).saturating_mul(1_000_000_000);
+            let candidate = pos.nseconds().saturating_add(bump);
+            match dur {
+                Some(d) if d.nseconds() > 0 => {
+                    candidate.min(d.nseconds().saturating_sub(200_000_000))
+                }
+                _ => candidate,
+            }
+        } else {
+            let dec = ((-delta_secs) as u64).saturating_mul(1_000_000_000);
+            pos.nseconds().saturating_sub(dec)
+        };
+        seek_precise(gst::ClockTime::from_nseconds(target_ns));
+    };
+
+    match action {
+        Action::PlayPause => play_btn.emit_clicked(),
+        Action::Fullscreen => fullscreen_btn.emit_clicked(),
+        Action::OpenFile => open_btn.emit_clicked(),
+        Action::OpenUrl => link_btn.emit_clicked(),
+        Action::NextTrack => next_btn.emit_clicked(),
+        Action::PrevTrack => prev_btn.emit_clicked(),
+        Action::Mute => volume_btn.emit_clicked(),
+        Action::VolumeUp => {
+            let v = (volume_scale.value() + 0.05).clamp(0.0, 1.0);
+            volume_scale.set_value(v);
+        }
+        Action::VolumeDown => {
+            let v = (volume_scale.value() - 0.05).clamp(0.0, 1.0);
+            volume_scale.set_value(v);
+        }
+        Action::SeekBackwardSmall => {
+            seek_relative(-5);
+            osd.show("media-seek-backward-symbolic", "-5s");
+        }
+        Action::SeekForwardSmall => {
+            seek_relative(5);
+            osd.show("media-seek-forward-symbolic", "+5s");
+        }
+        Action::SeekBackwardLarge => {
+            seek_relative(-10);
+            osd.show("media-seek-backward-symbolic", "-10s");
+        }
+        Action::SeekForwardLarge => {
+            seek_relative(10);
+            osd.show("media-seek-forward-symbolic", "+10s");
+        }
+        Action::JumpStart => {
+            seek_snap(gst::ClockTime::ZERO);
+            osd.show("media-skip-backward-symbolic", "Start");
+        }
+        Action::JumpEnd => {
+            if let Some(d) = pipeline.query_duration::<gst::ClockTime>()
+                && d.nseconds() > 0
+            {
+                seek_snap(gst::ClockTime::from_nseconds(
+                    d.nseconds().saturating_sub(2_000_000_000),
+                ));
+            }
+        }
+    }
+}

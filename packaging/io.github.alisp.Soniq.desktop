@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Soniq
+GenericName=Video Player
+Comment=A minimal, modern video player
+Exec=soniq %U
+Icon=io.github.alisp.Soniq
+Terminal=false
+Categories=AudioVideo;Player;Video;GTK;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/x-flv;video/3gpp;video/ogg;
+Keywords=video;movie;media;player;film;
+StartupNotify=true
