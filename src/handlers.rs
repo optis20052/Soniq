@@ -1191,10 +1191,16 @@ fn install_overlay_chrome(ui: &UiHandles) {
                 if let Some(parent) = controls.parent() {
                     const INSET: i32 = 8; // keep a comfortable margin from the window edges
                     let (bar_w, bar_h) = bar_size(&controls, &parent);
-                    let max_x = (parent.width() - bar_w - INSET).max(INSET);
-                    let max_y = (parent.height() - bar_h - INSET).max(INSET);
-                    nx = nx.clamp(INSET, max_x);
-                    ny = ny.clamp(INSET, max_y);
+                    // Keep up to INSET margin per side, but shrink the margin
+                    // (down to centered) when an axis has no slack, so a tight
+                    // window still allows movement on the other axis.
+                    let clamp_pos = |v: i32, avail: i32| {
+                        let lo = INSET.min(avail / 2);
+                        let hi = (avail - lo).max(lo);
+                        v.clamp(lo, hi)
+                    };
+                    nx = clamp_pos(nx, parent.width() - bar_w);
+                    ny = clamp_pos(ny, parent.height() - bar_h);
                 }
                 controls.set_margin_start(nx);
                 controls.set_margin_top(ny);
@@ -1209,28 +1215,57 @@ fn install_overlay_chrome(ui: &UiHandles) {
     {
         let controls = ui.controls.clone();
         let seek_scale = ui.seek_scale.clone();
+        let volume_revealer = ui.volume_revealer.clone();
+        let volume_btn = ui.volume_btn.clone();
+        let stop_btn = ui.stop_btn.clone();
+        let subtitle_btn = ui.subtitle_btn.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             let Some(parent) = controls.parent() else {
                 return ControlFlow::Continue;
             };
             const INSET: i32 = 8;
 
+            // Progressively collapse non-essential controls as the window
+            // narrows so the panel never outgrows the window. Transport + seek
+            // always stay; the volume slider drops first, then the volume icon,
+            // stop, and subtitles.
+            let w = parent.width();
+            let show_vol_slider = w >= 500;
+            if volume_revealer.reveals_child() != show_vol_slider {
+                volume_revealer.set_reveal_child(show_vol_slider);
+            }
+            for (widget, min) in [(&volume_btn, 440), (&stop_btn, 400), (&subtitle_btn, 360)] {
+                let vis = w >= min;
+                if widget.is_visible() != vis {
+                    widget.set_visible(vis);
+                }
+            }
+
             if controls.halign() == gtk::Align::Start {
                 // Dragged/absolute mode: keep it inside the window.
                 let (cw, ch) = bar_size(&controls, &parent);
-                // If the bar no longer fits the window, snap back to the
-                // default centered-bottom position so it can't overflow.
-                if cw + 2 * INSET > parent.width() || ch + 2 * INSET > parent.height() {
+                // Only fall back to centered-bottom when the bar is genuinely
+                // LARGER than the window (can't be contained at all). Merely
+                // being wider than window-minus-margins must NOT snap it back —
+                // that fought the drag every tick (blinking) and forced it to
+                // the bottom on release when there was no horizontal slack.
+                if cw > parent.width() || ch > parent.height() {
                     controls.set_halign(gtk::Align::Center);
                     controls.set_valign(gtk::Align::End);
                     controls.set_margin_start(0);
                     controls.set_margin_top(0);
                     controls.set_margin_bottom(8);
                 } else {
-                    let max_x = (parent.width() - cw - INSET).max(INSET);
-                    let max_y = (parent.height() - ch - INSET).max(INSET);
-                    let nx = controls.margin_start().clamp(INSET, max_x);
-                    let ny = controls.margin_top().clamp(INSET, max_y);
+                    // Clamp within the window, keeping up to INSET margin on
+                    // each side (less when space is tight), without ever
+                    // repositioning along an axis that still fits.
+                    let clamp_pos = |cur: i32, avail: i32| {
+                        let lo = INSET.min(avail / 2);
+                        let hi = (avail - lo).max(lo);
+                        cur.clamp(lo, hi)
+                    };
+                    let nx = clamp_pos(controls.margin_start(), parent.width() - cw);
+                    let ny = clamp_pos(controls.margin_top(), parent.height() - ch);
                     if nx != controls.margin_start() {
                         controls.set_margin_start(nx);
                     }
@@ -1248,7 +1283,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
                 // the bar's horizontal padding) — everything except the scale.
                 const SEEK_ROW_CHROME: i32 = 150;
                 let avail = parent.width() - 2 * SIDE_GUTTER - SEEK_ROW_CHROME;
-                let target = avail.clamp(160, 460);
+                let target = avail.clamp(110, 460);
                 if seek_scale.width_request() != target {
                     seek_scale.set_width_request(target);
                 }
