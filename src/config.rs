@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::resume::ResumeMode;
 use crate::shortcuts::{Action, Shortcut};
 use crate::state::AppState;
 use crate::subtitles::SubtitleStyle;
@@ -23,6 +24,8 @@ pub struct Config {
     /// action key, or absent = "no action".
     pub mouse_single: Option<String>,
     pub mouse_double: Option<String>,
+    /// Resume-playback behaviour (off / ask / always).
+    pub resume_mode: Option<ResumeMode>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -69,6 +72,7 @@ pub fn from_state(state: &AppState) -> Config {
         shortcuts: Some(shortcuts),
         mouse_single: state.mouse.single.get().map(|a| a.key().to_string()),
         mouse_double: state.mouse.double.get().map(|a| a.key().to_string()),
+        resume_mode: Some(state.resume_mode.get()),
     }
 }
 
@@ -107,6 +111,9 @@ pub fn apply_to_state(cfg: &Config, state: &AppState) {
         .mouse
         .double
         .set(cfg.mouse_double.as_deref().and_then(Action::from_key));
+    if let Some(mode) = cfg.resume_mode {
+        state.resume_mode.set(mode);
+    }
 }
 
 /// Load the config from disk (or default if absent/unreadable).

@@ -39,6 +39,13 @@ pub struct UiHandles {
     pub settings_revealer: gtk::Revealer,
     pub settings_view_stack: adw::ViewStack,
 
+    // Resume banner
+    pub resume_banner: gtk::Box,
+    pub resume_label: gtk::Label,
+    pub resume_check: gtk::CheckButton,
+    pub resume_btn: gtk::Button,
+    pub resume_dismiss_btn: gtk::Button,
+
     // Volume cluster
     pub volume_btn: gtk::Button,
     pub volume_scale: gtk::Scale,
@@ -415,6 +422,39 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     // ---- OSD notifications (top-center fading pill) ----
     let (osd, osd_widget) = crate::osd::Osd::new();
 
+    // ---- Resume banner (offers to continue a previously-watched file) ----
+    let resume_label = gtk::Label::new(Some(""));
+    resume_label.add_css_class("resume-text");
+
+    let resume_check = gtk::CheckButton::with_label("Always resume");
+    resume_check.add_css_class("resume-check");
+    resume_check.set_valign(gtk::Align::Center);
+
+    let resume_btn = gtk::Button::with_label("Resume");
+    resume_btn.add_css_class("pill");
+    resume_btn.add_css_class("suggested-action");
+
+    // Just a dismiss — playback already starts from the beginning, so there's
+    // no separate "start over" action needed.
+    let resume_dismiss_btn = gtk::Button::from_icon_name("window-close-symbolic");
+    resume_dismiss_btn.add_css_class("flat");
+    resume_dismiss_btn.set_valign(gtk::Align::Center);
+    resume_dismiss_btn.set_tooltip_text(Some("Dismiss"));
+
+    let resume_banner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
+        .margin_top(56)
+        .visible(false)
+        .build();
+    resume_banner.add_css_class("resume-banner");
+    resume_banner.append(&resume_label);
+    resume_banner.append(&resume_check);
+    resume_banner.append(&resume_btn);
+    resume_banner.append(&resume_dismiss_btn);
+
     // ---- Quick-settings drawer (slides in from the right) ----
     // The tab pages' content is (re)built on each open by handlers.rs so it
     // always reflects live track lists and effect values.
@@ -467,6 +507,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     overlay.add_overlay(&osd_widget);
     overlay.add_overlay(&controls);
     overlay.add_overlay(&settings_revealer);
+    overlay.add_overlay(&resume_banner);
 
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&overlay));
@@ -506,6 +547,11 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         settings_close_btn,
         settings_revealer,
         settings_view_stack,
+        resume_banner,
+        resume_label,
+        resume_check,
+        resume_btn,
+        resume_dismiss_btn,
         volume_btn,
         volume_scale,
         volume_revealer,
@@ -557,6 +603,20 @@ const CSS: &str = "
         font-size: 0.95em;
         text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
         padding: 0 8px;
+    }
+
+    /* Resume banner (top-center card offering to continue a watched file). */
+    .resume-banner {
+        background-color: rgba(20, 20, 22, 0.94);
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        border-radius: 12px;
+        padding: 8px 10px 8px 16px;
+        box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+    }
+    .resume-text { color: rgba(255, 255, 255, 0.95); font-weight: 500; }
+    .resume-check { color: rgba(255, 255, 255, 0.85); }
+    .resume-banner button.pill {
+        min-height: 30px; padding: 0 16px; border-radius: 999px;
     }
 
     /* Quick-settings drawer (slides in from the right). */

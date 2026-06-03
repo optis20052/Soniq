@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::effects::Effects;
+use crate::resume::{ResumeMode, ResumeStore};
 use crate::shortcuts::{MouseBindings, Shortcuts};
 use crate::subtitles::Subtitles;
 
@@ -85,6 +86,15 @@ pub struct AppState {
     pub subtitle_margin: Rc<Cell<i32>>,
     /// The currently-loaded URI, kept so a hardware-decode toggle can reload.
     pub current_uri: Rc<RefCell<Option<String>>>,
+    /// Per-file "resume where you left off" history + how to use it.
+    pub resume_store: ResumeStore,
+    pub resume_mode: Rc<Cell<ResumeMode>>,
+    /// Set on load when we should auto-seek to a remembered position once the
+    /// pipeline prerolls (Always mode); the AsyncDone handler consumes it.
+    pub pending_resume_pos: Rc<Cell<Option<u64>>>,
+    /// In Ask mode, the position the resume banner would jump to (None = no
+    /// pending prompt).
+    pub resume_prompt_pos: Rc<Cell<Option<u64>>>,
 }
 
 impl AppState {
@@ -117,6 +127,10 @@ impl AppState {
             subtitle_scale: Rc::new(Cell::new(crate::theme::SUBTITLE_SCALE_DEFAULT)),
             subtitle_margin: Rc::new(Cell::new(crate::theme::SUBTITLE_MARGIN_DEFAULT)),
             current_uri: Rc::new(RefCell::new(None)),
+            resume_store: ResumeStore::load(),
+            resume_mode: Rc::new(Cell::new(ResumeMode::default())),
+            pending_resume_pos: Rc::new(Cell::new(None)),
+            resume_prompt_pos: Rc::new(Cell::new(None)),
         }
     }
 

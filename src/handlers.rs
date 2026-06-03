@@ -11,6 +11,7 @@ use gtk::glib::{self, ControlFlow, Propagation};
 
 use crate::effects::{AspectMode, EQ_PRESETS};
 use crate::pipeline::PipelineHandles;
+use crate::resume::ResumeMode;
 use crate::shortcuts::Action;
 use crate::state::AppState;
 use crate::theme;
@@ -49,7 +50,16 @@ pub fn wire(
         let effects_load = state.effects.clone();
         let subtitle_delay_load = state.subtitle_delay_ns.clone();
         let current_uri_load = state.current_uri.clone();
+        let resume_store_load = state.resume_store.clone();
+        let resume_mode_load = state.resume_mode.clone();
+        let pending_resume_load = state.pending_resume_pos.clone();
+        let resume_prompt_load = state.resume_prompt_pos.clone();
+        let resume_banner = ui.resume_banner.clone();
+        let resume_label = ui.resume_label.clone();
+        let resume_check = ui.resume_check.clone();
         Rc::new(move |file: &gio::File| {
+            // Persist the outgoing file's position before we switch away.
+            resume_store_load.flush();
             let uri = file.uri();
             let local = uri.starts_with("file://");
             is_local.set(local);
@@ -96,6 +106,37 @@ pub fn wire(
             *current_uri_load.borrow_mut() = Some(uri.to_string());
             effects_load.reset_for_new_video(&pipeline);
             subtitle_delay_load.set(0);
+
+            // Resume: if this file was watched before, either auto-seek
+            // (Always) or offer a banner (Ask). Capture the target now, before
+            // the position timer overwrites the stored entry with ~0.
+            resume_banner.set_visible(false);
+            pending_resume_load.set(None);
+            resume_prompt_load.set(None);
+            let mode = resume_mode_load.get();
+            if mode != ResumeMode::Off
+                && let Some(entry) = resume_store_load.resumable(uri.as_str())
+            {
+                let at = format_time(gst::ClockTime::from_nseconds(entry.pos_ns));
+                match mode {
+                    ResumeMode::Always => {
+                        pending_resume_load.set(Some(entry.pos_ns));
+                        osd.show("media-seek-forward-symbolic", &format!("Resuming at {at}"));
+                    }
+                    ResumeMode::Ask => {
+                        resume_prompt_load.set(Some(entry.pos_ns));
+                        resume_label.set_text(&format!("Resume from {at}?"));
+                        resume_check.set_active(false);
+                        resume_banner.set_visible(true);
+                        let banner = resume_banner.clone();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_secs(12),
+                            move || banner.set_visible(false),
+                        );
+                    }
+                    ResumeMode::Off => {}
+                }
+            }
             play_btn.set_icon_name("media-playback-pause-symbolic");
             content_stack.set_visible_child_name("video");
             controls.set_visible(true);
@@ -261,6 +302,7 @@ pub fn wire(
         let subtitle_label_prefs = ui.subtitle_label.clone();
         let subtitle_scale_prefs = state.subtitle_scale.clone();
         let subtitle_margin_prefs = state.subtitle_margin.clone();
+        let resume_mode_prefs = state.resume_mode.clone();
         ui.settings_btn.connect_clicked(move |_| {
             // === General page ===
             let dev_group = adw::PreferencesGroup::builder()
@@ -284,10 +326,27 @@ pub fn wire(
             }
             dev_group.add(&net_row);
 
+            // Playback group: resume-where-you-left-off behaviour.
+            let playback_group = adw::PreferencesGroup::builder().title("Playback").build();
+            let resume_row = adw::ComboRow::builder()
+                .title("Resume playback")
+                .subtitle("Continue files where you left off")
+                .model(&gtk::StringList::new(&["Off", "Ask each time", "Always resume"]))
+                .selected(resume_mode_prefs.get().to_index())
+                .build();
+            {
+                let resume_mode = resume_mode_prefs.clone();
+                resume_row.connect_selected_notify(move |r| {
+                    resume_mode.set(ResumeMode::from_index(r.selected()));
+                });
+            }
+            playback_group.add(&resume_row);
+
             let general_page = adw::PreferencesPage::builder()
                 .title("General")
                 .icon_name("applications-system-symbolic")
                 .build();
+            general_page.add(&playback_group);
             general_page.add(&dev_group);
 
             // === Shortcuts page ===
@@ -670,6 +729,9 @@ pub fn wire(
 
     // ---------- Quick-settings drawer (Video / Audio / Subtitles) ----------
     install_quick_settings(ui, pipe, state);
+
+    // ---------- Resume banner + periodic history flush ----------
+    install_resume(ui, pipe, state);
     // Apply the initial subtitle style to the label so it's styled from the
     // first cue (and reflects any persisted preferences).
     apply_subtitle_style(
@@ -693,6 +755,7 @@ pub fn wire(
         let save_state = state.clone();
         ui.window.connect_close_request(move |_| {
             crate::config::save(&save_state); // persist settings
+            save_state.resume_store.flush(); // persist watch history
             pipeline.set_state(gst::State::Null).ok(); // finalizes downloadbuffer (temp-remove)
             crate::pipeline::clear_download_cache(); // belt-and-suspenders: wipe any cache file
             let _ = &bus_watch; // keep the bus watch guard alive until the window dies
@@ -724,6 +787,9 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
     let subtitles = state.subtitles.clone();
     let subtitle_label = ui.subtitle_label.clone();
     let subtitle_delay_ns = state.subtitle_delay_ns.clone();
+    let resume_store_t = state.resume_store.clone();
+    let resume_mode_t = state.resume_mode.clone();
+    let current_uri_t = state.current_uri.clone();
 
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         let (_, gst_state, _) = pipeline.state(gst::ClockTime::ZERO);
@@ -740,6 +806,18 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
 
         let pos = pipeline.query_position::<gst::ClockTime>();
         let dur = pipeline.query_duration::<gst::ClockTime>();
+
+        // Remember where we are for resume-on-reopen (in-memory; flushed
+        // periodically and on close). record() prunes finished files itself.
+        if resume_mode_t.get() != ResumeMode::Off
+            && (gst_state == gst::State::Playing || gst_state == gst::State::Paused)
+            && let (Some(p), Some(d)) = (pos, dur)
+            && p.nseconds() > 0
+            && d.nseconds() > 0
+            && let Some(uri) = current_uri_t.borrow().as_ref()
+        {
+            resume_store_t.record(uri, p.nseconds(), d.nseconds());
+        }
 
         let queue_bytes_now: u64 = queue_ref
             .lock()
@@ -964,6 +1042,15 @@ fn install_bus_watch(
                 // were so the user sees no jump.
                 if let Some(target_ns) = pending_restore_pos.take() {
                     eprintln!("[watchdog] hard-reload complete \u{2014} seeking to {target_ns}ns");
+                    pipeline
+                        .seek_simple(
+                            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                            gst::ClockTime::from_nseconds(target_ns),
+                        )
+                        .ok();
+                } else if let Some(target_ns) = state_for_bus.pending_resume_pos.take() {
+                    // Auto-resume (Always mode): seek to the remembered position
+                    // once the freshly-loaded pipeline has prerolled.
                     pipeline
                         .seek_simple(
                             gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
@@ -2271,6 +2358,48 @@ fn run_action(
                 ));
             }
         }
+    }
+}
+
+// ===================== Resume (continue where you left off) ==================
+
+/// Wire the resume banner's buttons and a periodic flush of the watch history.
+fn install_resume(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    let banner = ui.resume_banner.clone();
+
+    {
+        let banner = banner.clone();
+        let check = ui.resume_check.clone();
+        let pipeline = pipe.pipeline.clone();
+        let state = state.clone();
+        ui.resume_btn.connect_clicked(move |_| {
+            if let Some(pos) = state.resume_prompt_pos.take() {
+                state.request_seek(&pipeline, pos);
+            }
+            if check.is_active() {
+                // The user opted in: remember and auto-resume from now on.
+                state.resume_mode.set(ResumeMode::Always);
+            }
+            banner.set_visible(false);
+        });
+    }
+    {
+        let banner = banner.clone();
+        let state = state.clone();
+        ui.resume_dismiss_btn.connect_clicked(move |_| {
+            state.resume_prompt_pos.set(None); // keep playing from the start
+            banner.set_visible(false);
+        });
+    }
+
+    // Flush the in-memory watch history to disk periodically (also done on
+    // file switch and on close) so a crash loses at most a few seconds.
+    {
+        let store = state.resume_store.clone();
+        glib::timeout_add_seconds_local(5, move || {
+            store.flush();
+            ControlFlow::Continue
+        });
     }
 }
 

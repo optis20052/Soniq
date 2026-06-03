@@ -3,6 +3,7 @@ mod effects;
 mod handlers;
 mod osd;
 mod pipeline;
+mod resume;
 mod shortcuts;
 mod state;
 mod subtitles;
