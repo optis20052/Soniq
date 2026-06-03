@@ -13,6 +13,7 @@ use crate::subtitles::SubtitleStyle;
 #[derive(Default, Serialize, Deserialize)]
 pub struct Config {
     pub subtitle_style: Option<SubtitleStyle>,
+    pub show_fps: Option<bool>,
     /// Subtitle size multiplier (the quick-settings "Scale").
     pub subtitle_scale: Option<f64>,
     /// Subtitle vertical offset / position (bottom margin in px).
@@ -65,6 +66,7 @@ pub fn from_state(state: &AppState) -> Config {
 
     Config {
         subtitle_style: Some(state.subtitles.style.lock().unwrap().clone()),
+        show_fps: Some(state.show_fps.get()),
         subtitle_scale: Some(state.subtitle_scale.get()),
         subtitle_margin: Some(state.subtitle_margin.get()),
         show_debug: Some(state.show_debug.get()),
@@ -92,6 +94,9 @@ pub fn apply_to_state(cfg: &Config, state: &AppState) {
     }
     if let Some(debug) = cfg.show_debug {
         state.show_debug.set(debug);
+    }
+    if let Some(fps) = cfg.show_fps {
+        state.show_fps.set(fps);
     }
     if let Some(v) = cfg.volume {
         state.volume.set(v.clamp(0.0, 1.0));

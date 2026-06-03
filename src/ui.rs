@@ -64,6 +64,7 @@ pub struct UiHandles {
     pub buffer_chip: gtk::Box,
     pub buffer_label: gtk::Label,
     pub debug_label: gtk::Label,
+    pub fps_label: gtk::Label,
     /// Custom external-subtitle renderer (we draw SRT cues here ourselves).
     pub subtitle_label: gtk::Label,
     /// Dedicated CSS provider for the subtitle label, regenerated live when
@@ -449,6 +450,16 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     debug_label.set_visible(false);
     debug_label.set_can_target(false);
 
+    // ---- FPS overlay (live displayed frame rate) ----
+    let fps_label = gtk::Label::new(Some(""));
+    fps_label.add_css_class("fps-overlay");
+    fps_label.set_halign(gtk::Align::Start);
+    fps_label.set_valign(gtk::Align::Start);
+    fps_label.set_margin_top(50);
+    fps_label.set_margin_start(12);
+    fps_label.set_visible(false);
+    fps_label.set_can_target(false);
+
     let buffer_spinner = gtk::Spinner::new();
     buffer_spinner.set_size_request(22, 22);
     buffer_spinner.set_spinning(true);
@@ -574,6 +585,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     overlay.add_overlay(&top_bar);
     overlay.add_overlay(&buffer_chip);
     overlay.add_overlay(&debug_label);
+    overlay.add_overlay(&fps_label);
     overlay.add_overlay(&subtitle_label);
     overlay.add_overlay(&osd_widget);
     overlay.add_overlay(&controls);
@@ -636,6 +648,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         buffer_chip,
         buffer_label,
         debug_label,
+        fps_label,
         subtitle_label,
         subtitle_css,
         osd,
@@ -839,6 +852,20 @@ const CSS: &str = "
     .volume-area scale { padding: 0 6px; min-width: 96px; }
     .volume-area scale highlight { background-color: #3584e4; }
     .volume-area scale slider { min-width: 12px; min-height: 12px; }
+
+    .fps-overlay {
+        background-color: rgba(0, 0, 0, 0.62);
+        color: rgba(120, 255, 140, 0.95);
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        border-radius: 7px;
+        padding: 3px 9px;
+        font-family: monospace;
+        font-size: 0.82em;
+        font-weight: 600;
+        font-feature-settings: 'tnum';
+    }
+    /* Turns red when the displayed rate drops well below the source rate. */
+    .fps-overlay.fps-low { color: rgba(255, 110, 110, 0.98); }
 
     .debug-overlay {
         background-color: rgba(0, 0, 0, 0.7);

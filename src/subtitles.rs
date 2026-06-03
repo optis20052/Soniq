@@ -344,19 +344,20 @@ pub fn subtitle_css(style: &SubtitleStyle, scale: f64) -> String {
     let outline = css_color(style.outline_color);
 
     let effect = if style.draw_outline && style.outline_width > 0.0 {
-        // Build the outline from many copies of the text offset around a circle
-        // of radius `w`. Eight hard offsets leave gaps at the corners (jagged
-        // stair-steps); 16 evenly-spaced copies plus a small blur give a smooth,
-        // even outline at any size.
+        // Build the outline from many SHARP copies of the text offset around a
+        // circle of radius `w`. Eight hard offsets leave gaps at the corners
+        // (jagged stair-steps); 16 evenly-spaced copies fill them for a smooth
+        // edge. We deliberately use NO blur: a blurred text-shadow is a Gaussian
+        // node that GTK re-applies every video frame the subtitle is on screen,
+        // which tanks the frame rate at large sizes. Sharp copies are cheap.
         let w = style.outline_width;
-        let blur = (w * 0.35).max(0.6);
         let n = 16;
         let shadows: Vec<String> = (0..n)
             .map(|i| {
                 let angle = std::f32::consts::TAU * (i as f32) / (n as f32);
                 let dx = ((w * angle.cos()) * 100.0).round() / 100.0;
                 let dy = ((w * angle.sin()) * 100.0).round() / 100.0;
-                format!("{dx}px {dy}px {blur}px {outline}")
+                format!("{dx}px {dy}px 0 {outline}")
             })
             .collect();
         format!("text-shadow: {};", shadows.join(", "))

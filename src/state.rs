@@ -24,6 +24,8 @@ pub struct AppState {
     pub user_paused: Rc<Cell<bool>>,
     /// Preferences → Show network stats. Controls the debug overlay.
     pub show_debug: Rc<Cell<bool>>,
+    /// Preferences → Show FPS. Controls the live frame-rate overlay.
+    pub show_fps: Rc<Cell<bool>>,
     /// Timestamp of the last user-driven seek (change-value event).
     /// `is_dragging_now()` checks this; the watchdog also uses it as a grace
     /// period after a seek so we don't fire mid-buffer-refill.
@@ -103,6 +105,7 @@ impl AppState {
             is_local: Rc::new(Cell::new(false)),
             user_paused: Rc::new(Cell::new(false)),
             show_debug: Rc::new(Cell::new(false)),
+            show_fps: Rc::new(Cell::new(false)),
             last_user_seek: Rc::new(Cell::new(
                 Instant::now() - std::time::Duration::from_secs(10),
             )),

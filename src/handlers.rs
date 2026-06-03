@@ -314,6 +314,7 @@ pub fn wire(
         let subtitle_scale_prefs = state.subtitle_scale.clone();
         let subtitle_margin_prefs = state.subtitle_margin.clone();
         let resume_mode_prefs = state.resume_mode.clone();
+        let show_fps_prefs = state.show_fps.clone();
         ui.settings_btn.connect_clicked(move |_| {
             // === General page ===
             let dev_group = adw::PreferencesGroup::builder()
@@ -336,6 +337,17 @@ pub fn wire(
                 });
             }
             dev_group.add(&net_row);
+
+            let fps_row = adw::SwitchRow::builder()
+                .title("Show FPS")
+                .subtitle("Live displayed frame rate vs the source rate")
+                .active(show_fps_prefs.get())
+                .build();
+            {
+                let show_fps = show_fps_prefs.clone();
+                fps_row.connect_active_notify(move |row| show_fps.set(row.is_active()));
+            }
+            dev_group.add(&fps_row);
 
             // Playback group: resume-where-you-left-off behaviour.
             let playback_group = adw::PreferencesGroup::builder().title("Playback").build();
@@ -727,6 +739,9 @@ pub fn wire(
 
     // ---------- Recently-played list on the home screen + Stop→home ----------
     install_recents(ui, pipe, state, &load_file);
+
+    // ---------- Live FPS overlay ----------
+    install_fps(ui, pipe, state);
     // Apply the initial subtitle style to the label so it's styled from the
     // first cue (and reflects any persisted preferences).
     apply_subtitle_style(
@@ -2358,6 +2373,69 @@ fn run_action(
             }
         }
     }
+}
+
+// ===================== Live FPS overlay ======================================
+
+/// Source (nominal) frame rate from the negotiated video caps, if known.
+fn source_framerate(pipeline: &gst::Element) -> Option<f64> {
+    let pad = pipeline.emit_by_name::<Option<gst::Pad>>("get-video-pad", &[&0i32])?;
+    let caps = pad.current_caps()?;
+    let s = caps.structure(0)?;
+    let fr = s.get::<gst::Fraction>("framerate").ok()?;
+    let (n, d) = (fr.numer(), fr.denom());
+    (d != 0).then(|| n as f64 / d as f64)
+}
+
+/// Count actually-displayed frames (paintable invalidations) and show the live
+/// rate vs the source rate, so dropped frames are visible.
+fn install_fps(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    let frames = Rc::new(Cell::new(0u32));
+    {
+        let frames = frames.clone();
+        pipe.paintable.connect_invalidate_contents(move |_| {
+            frames.set(frames.get().wrapping_add(1));
+        });
+    }
+
+    let fps_label = ui.fps_label.clone();
+    let show_fps = state.show_fps.clone();
+    let pipeline = pipe.pipeline.clone();
+    let last = Cell::new(0u32);
+    const INTERVAL_MS: u64 = 500;
+    glib::timeout_add_local(std::time::Duration::from_millis(INTERVAL_MS), move || {
+        let cur = frames.get();
+        let delta = cur.wrapping_sub(last.get());
+        last.set(cur);
+
+        let (_, st, _) = pipeline.state(gst::ClockTime::ZERO);
+        let visible = show_fps.get() && st == gst::State::Playing;
+        if !visible {
+            if fps_label.is_visible() {
+                fps_label.set_visible(false);
+            }
+            return ControlFlow::Continue;
+        }
+
+        let fps = delta as f64 * (1000.0 / INTERVAL_MS as f64);
+        let nominal = source_framerate(&pipeline);
+        fps_label.set_text(&match nominal {
+            Some(n) => format!("{fps:.0} / {n:.0} fps"),
+            None => format!("{fps:.0} fps"),
+        });
+        // 0.85 (not 0.9) so the ±2 fps jitter from the 500 ms window doesn't
+        // flicker red during normal playback.
+        let low = nominal.map(|n| fps < n * 0.85).unwrap_or(false);
+        if low {
+            fps_label.add_css_class("fps-low");
+        } else {
+            fps_label.remove_css_class("fps-low");
+        }
+        if !fps_label.is_visible() {
+            fps_label.set_visible(true);
+        }
+        ControlFlow::Continue
+    });
 }
 
 // ===================== Recently-played list (home screen) ====================
