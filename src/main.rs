@@ -1,4 +1,5 @@
 mod config;
+mod effects;
 mod handlers;
 mod osd;
 mod pipeline;

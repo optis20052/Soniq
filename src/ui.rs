@@ -31,6 +31,12 @@ pub struct UiHandles {
     pub position_label: gtk::Label,
     pub duration_label: gtk::Label,
 
+    // Quick-settings drawer
+    pub settings_panel_btn: gtk::Button,
+    pub settings_close_btn: gtk::Button,
+    pub settings_revealer: gtk::Revealer,
+    pub settings_view_stack: adw::ViewStack,
+
     // Volume cluster
     pub volume_btn: gtk::Button,
     pub volume_scale: gtk::Scale,
@@ -56,6 +62,10 @@ pub struct UiHandles {
 
 /// Install the application-wide CSS once, before any UI is built.
 pub fn install_css() {
+    // A media player reads best dark; this also keeps the embedded Adwaita rows
+    // in the quick-settings drawer and the Preferences window consistently dark.
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+
     let css = gtk::CssProvider::new();
     css.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(
@@ -241,15 +251,33 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     subtitle_btn.set_tooltip_text(Some("Subtitles"));
     subtitle_btn.set_focus_on_click(false);
 
+    // Gear: opens the IINA-style quick-settings drawer.
+    let settings_panel_btn = gtk::Button::from_icon_name("emblem-system-symbolic");
+    settings_panel_btn.add_css_class("osd-button");
+    settings_panel_btn.set_tooltip_text(Some("Quick settings"));
+    settings_panel_btn.set_focus_on_click(false);
+
     // Keep every control vertically centred so its round hover stays a circle.
     // (Otherwise the shorter buttons stretch to the play button's height and
     // their pill-radius hover renders as an oval.)
     for b in [
-        &prev_btn, &play_btn, &stop_btn, &next_btn, &subtitle_btn, &fullscreen_btn, &volume_btn,
+        &prev_btn,
+        &play_btn,
+        &stop_btn,
+        &next_btn,
+        &subtitle_btn,
+        &settings_panel_btn,
+        &fullscreen_btn,
+        &volume_btn,
     ] {
         b.set_valign(gtk::Align::Center);
     }
     volume_box.set_valign(gtk::Align::Center);
+
+    // Secondary controls (the right cluster) are smaller than the transport.
+    for b in [&stop_btn, &subtitle_btn, &settings_panel_btn, &fullscreen_btn] {
+        b.add_css_class("secondary-btn");
+    }
 
     // Center transport cluster (prev / play / next) — the play button sits dead
     // centre of the bar; stop moves to the right cluster.
@@ -263,15 +291,16 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     transport.append(&play_btn);
     transport.append(&next_btn);
 
-    // Right utility cluster (stop / subtitles / fullscreen).
+    // Right utility cluster (stop / subtitles / settings / fullscreen).
     let right_cluster = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+        .spacing(2)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
         .build();
     right_cluster.append(&stop_btn);
     right_cluster.append(&subtitle_btn);
+    right_cluster.append(&settings_panel_btn);
     right_cluster.append(&fullscreen_btn);
 
     // IINA-style 3-zone row via CenterBox: volume far-left, transport ALWAYS
@@ -384,6 +413,48 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     // ---- OSD notifications (top-center fading pill) ----
     let (osd, osd_widget) = crate::osd::Osd::new();
 
+    // ---- Quick-settings drawer (slides in from the right) ----
+    // The tab pages' content is (re)built on each open by handlers.rs so it
+    // always reflects live track lists and effect values.
+    let settings_view_stack = adw::ViewStack::new();
+
+    let settings_switcher = adw::ViewSwitcher::builder()
+        .stack(&settings_view_stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .hexpand(true)
+        .build();
+
+    let settings_close_btn = gtk::Button::from_icon_name("window-close-symbolic");
+    settings_close_btn.add_css_class("osd-button");
+    settings_close_btn.set_valign(gtk::Align::Center);
+    settings_close_btn.set_tooltip_text(Some("Close"));
+
+    let settings_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    settings_header.add_css_class("quick-settings-header");
+    settings_header.append(&settings_switcher);
+    settings_header.append(&settings_close_btn);
+
+    let settings_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&settings_view_stack)
+        .build();
+
+    let settings_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    settings_panel.add_css_class("quick-settings-panel");
+    settings_panel.set_size_request(360, -1);
+    settings_panel.append(&settings_header);
+    settings_panel.append(&settings_scroll);
+
+    let settings_revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideLeft)
+        .transition_duration(250)
+        .reveal_child(false)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Fill)
+        .child(&settings_panel)
+        .build();
+
     // ---- Root overlay + window ----
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&content_stack));
@@ -393,6 +464,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     overlay.add_overlay(&subtitle_label);
     overlay.add_overlay(&osd_widget);
     overlay.add_overlay(&controls);
+    overlay.add_overlay(&settings_revealer);
 
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&overlay));
@@ -428,6 +500,10 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         title_label,
         position_label,
         duration_label,
+        settings_panel_btn,
+        settings_close_btn,
+        settings_revealer,
+        settings_view_stack,
         volume_btn,
         volume_scale,
         volume_revealer,
@@ -480,6 +556,25 @@ const CSS: &str = "
         text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
         padding: 0 8px;
     }
+
+    /* Quick-settings drawer (slides in from the right). */
+    .quick-settings-panel {
+        background-color: rgba(28, 28, 32, 0.96);
+        border-left: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: -8px 0 28px rgba(0, 0, 0, 0.45);
+    }
+    .quick-settings-header {
+        padding: 8px 8px 8px 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+        background-color: rgba(0, 0, 0, 0.2);
+    }
+    /* Let the Adwaita preference rows blend into the dark drawer. */
+    .quick-settings-panel scrolledwindow,
+    .quick-settings-panel preferencespage,
+    .quick-settings-panel viewport {
+        background-color: transparent;
+    }
+    .quick-settings-panel preferencespage > * { background-color: transparent; }
     /* Close button gets a red hover tint, like every desktop. */
     .osd-button.close-button:hover { background-color: rgba(232, 67, 62, 0.85); }
 
@@ -522,6 +617,15 @@ const CSS: &str = "
         color: #ffffff;
     }
     .controls-bar button:active { background-color: rgba(255, 255, 255, 0.22); }
+    /* Secondary controls (stop / subtitles / settings / fullscreen) — smaller
+       than the transport buttons and tucked to the right edge. */
+    .controls-bar button.secondary-btn {
+        min-width: 26px; min-height: 26px;
+        padding: 3px;
+        color: rgba(255, 255, 255, 0.78);
+    }
+    .controls-bar button.secondary-btn image { -gtk-icon-size: 15px; }
+
     /* Prominent filled play/pause button — the hero control. */
     .controls-bar button.play-btn {
         background-color: rgba(255, 255, 255, 0.82);

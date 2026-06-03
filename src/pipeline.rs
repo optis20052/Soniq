@@ -36,6 +36,16 @@ pub fn build_pipeline(state: &AppState) -> PipelineHandles {
     let paintable: gdk::Paintable = sink.property("paintable");
     pipeline.set_property("video-sink", &sink);
 
+    // Live video/audio effect filters for the quick-settings panel. Installed
+    // once here (they survive load_file, which never rebuilds the playbin); the
+    // quick-settings handlers tweak their child elements' properties live.
+    if let Some(vfilter) = state.effects.build_video_filter() {
+        pipeline.set_property("video-filter", &vfilter);
+    }
+    if let Some(afilter) = state.effects.build_audio_filter() {
+        pipeline.set_property("audio-filter", &afilter);
+    }
+
     // Same hardening for the audio sink (tuned once the actual sink appears).
     let audio_sink = gst::ElementFactory::make("autoaudiosink")
         .build()

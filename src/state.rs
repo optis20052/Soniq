@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::effects::Effects;
 use crate::shortcuts::{MouseBindings, Shortcuts};
 use crate::subtitles::Subtitles;
 
@@ -72,6 +73,18 @@ pub struct AppState {
     pub playlist_idx: Rc<Cell<usize>>,
     /// Last volume (0.0–1.0), mirrored from the slider and persisted.
     pub volume: Rc<Cell<f64>>,
+    /// Live audio/video effects (quick-settings panel). Element refs are filled
+    /// in by `build_pipeline`; the params reset per video.
+    pub effects: Effects,
+    /// Subtitle timing offset in ns (positive = subs appear later). Consulted
+    /// when looking up the active cue. Resets per video.
+    pub subtitle_delay_ns: Rc<Cell<i64>>,
+    /// Subtitle size multiplier (1.0 = the style's font size). Resets per video.
+    pub subtitle_scale: Rc<Cell<f64>>,
+    /// Subtitle vertical position as a bottom margin in px. Resets per video.
+    pub subtitle_margin: Rc<Cell<i32>>,
+    /// The currently-loaded URI, kept so a hardware-decode toggle can reload.
+    pub current_uri: Rc<RefCell<Option<String>>>,
 }
 
 impl AppState {
@@ -99,6 +112,11 @@ impl AppState {
             playlist: Rc::new(RefCell::new(Vec::new())),
             playlist_idx: Rc::new(Cell::new(0)),
             volume: Rc::new(Cell::new(1.0)),
+            effects: Effects::new(),
+            subtitle_delay_ns: Rc::new(Cell::new(0)),
+            subtitle_scale: Rc::new(Cell::new(1.0)),
+            subtitle_margin: Rc::new(Cell::new(96)),
+            current_uri: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -112,7 +130,7 @@ impl AppState {
         } else {
             self.seek_in_flight.set(true);
             self.pending_seek.set(None);
-            do_seek(pipeline, target_ns);
+            do_seek(pipeline, target_ns, self.effects.speed.get());
         }
     }
 
@@ -120,7 +138,7 @@ impl AppState {
     /// while this one was in flight, issue it now; else mark idle.
     pub fn on_seek_done(&self, pipeline: &gst::Element) {
         if let Some(target_ns) = self.pending_seek.take() {
-            do_seek(pipeline, target_ns);
+            do_seek(pipeline, target_ns, self.effects.speed.get());
         } else {
             self.seek_in_flight.set(false);
         }
@@ -133,16 +151,28 @@ impl AppState {
     }
 }
 
-fn do_seek(pipeline: &gst::Element, target_ns: u64) {
+fn do_seek(pipeline: &gst::Element, target_ns: u64, rate: f64) {
     use gst::prelude::ElementExtManual;
+    let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
+    let target = gst::ClockTime::from_nseconds(target_ns);
     // ACCURATE (not KEY_UNIT|SNAP_NEAREST): land exactly on the requested
     // time. Keyframe-snapping made repeated clicks at the same spot jump to
     // different sparse keyframes (-10/-20s). Coalescing keeps only one of
     // these in flight so the decoder isn't flooded.
-    pipeline
-        .seek_simple(
-            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-            gst::ClockTime::from_nseconds(target_ns),
-        )
-        .ok();
+    if (rate - 1.0).abs() < 1e-6 {
+        pipeline.seek_simple(flags, target).ok();
+    } else {
+        // A full seek is needed to carry a non-1.0 playback rate; seek_simple
+        // would silently reset it to 1.0.
+        pipeline
+            .seek(
+                rate,
+                flags,
+                gst::SeekType::Set,
+                target,
+                gst::SeekType::End,
+                gst::ClockTime::ZERO,
+            )
+            .ok();
+    }
 }

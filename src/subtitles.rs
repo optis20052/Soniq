@@ -108,10 +108,17 @@ pub struct SubtitleStyle {
     /// Outline color, big-endian ARGB.
     pub outline_color: u32,
     pub draw_outline: bool,
+    /// Outline thickness in px (drives the layered text-shadow offsets).
+    #[serde(default = "default_outline_width")]
+    pub outline_width: f32,
     pub draw_shadow: bool,
     /// Shade a translucent box behind the text.
     pub shaded_background: bool,
     pub valign: VAlign,
+}
+
+fn default_outline_width() -> f32 {
+    2.0
 }
 
 impl Default for SubtitleStyle {
@@ -121,6 +128,7 @@ impl Default for SubtitleStyle {
             color: 0xFFFF_FFFF,        // opaque white
             outline_color: 0xFF00_0000, // opaque black
             draw_outline: true,
+            outline_width: default_outline_width(),
             draw_shadow: true,
             shaded_background: false,
             valign: VAlign::Bottom,
@@ -303,8 +311,9 @@ impl Subtitles {
 }
 
 /// Generate CSS for the `.subtitle-text` label from a SubtitleStyle. Drives
-/// the live look of our custom subtitle renderer.
-pub fn subtitle_css(style: &SubtitleStyle) -> String {
+/// the live look of our custom subtitle renderer. `scale` multiplies the font
+/// size (1.0 = the style's size) for the quick-settings "Scale" control.
+pub fn subtitle_css(style: &SubtitleStyle, scale: f64) -> String {
     let desc = gtk::pango::FontDescription::from_string(&style.font_desc);
     let family = desc
         .family()
@@ -314,7 +323,7 @@ pub fn subtitle_css(style: &SubtitleStyle) -> String {
     if size_pt < 1.0 {
         size_pt = 22.0;
     }
-    let px = (size_pt * 96.0 / 72.0).round() as i32;
+    let px = ((size_pt * 96.0 / 72.0) * scale as f32).round().max(1.0) as i32;
     let weight = if desc.weight() >= gtk::pango::Weight::Bold {
         700
     } else {
@@ -334,10 +343,12 @@ pub fn subtitle_css(style: &SubtitleStyle) -> String {
     let color = css_color(style.color);
     let outline = css_color(style.outline_color);
 
-    let effect = if style.draw_outline {
+    let effect = if style.draw_outline && style.outline_width > 0.0 {
+        let w = style.outline_width;
         format!(
-            "text-shadow: -2px -2px 0 {o}, 2px -2px 0 {o}, -2px 2px 0 {o}, 2px 2px 0 {o}, \
-             0 2px 0 {o}, 0 -2px 0 {o}, 2px 0 0 {o}, -2px 0 0 {o};",
+            "text-shadow: -{w}px -{w}px 0 {o}, {w}px -{w}px 0 {o}, -{w}px {w}px 0 {o}, \
+             {w}px {w}px 0 {o}, 0 {w}px 0 {o}, 0 -{w}px 0 {o}, {w}px 0 0 {o}, -{w}px 0 0 {o};",
+            w = w,
             o = outline
         )
     } else if style.draw_shadow {

@@ -9,6 +9,7 @@ use gtk::gio;
 use gtk::pango;
 use gtk::glib::{self, ControlFlow, Propagation};
 
+use crate::effects::{AspectMode, EQ_PRESETS};
 use crate::pipeline::PipelineHandles;
 use crate::shortcuts::Action;
 use crate::state::AppState;
@@ -44,6 +45,11 @@ pub fn wire(
         let playlist_idx = state.playlist_idx.clone();
         let volume_scale = ui.volume_scale.clone();
         let osd = ui.osd.clone();
+        let effects_load = state.effects.clone();
+        let subtitle_delay_load = state.subtitle_delay_ns.clone();
+        let subtitle_scale_load = state.subtitle_scale.clone();
+        let subtitle_margin_load = state.subtitle_margin.clone();
+        let current_uri_load = state.current_uri.clone();
         Rc::new(move |file: &gio::File| {
             let uri = file.uri();
             let local = uri.starts_with("file://");
@@ -84,6 +90,14 @@ pub fn wire(
             // volume to 100%, which would desync from the slider.
             pipeline.set_property("volume", volume_scale.value());
             pipeline.set_state(gst::State::Playing).ok();
+            // Reset all per-video quick settings to defaults for the new file
+            // (subtitle text-style stays global). Track lists repopulate when
+            // the panel is next opened (caps are only valid after preroll).
+            *current_uri_load.borrow_mut() = Some(uri.to_string());
+            effects_load.reset_for_new_video(&pipeline);
+            subtitle_delay_load.set(0);
+            subtitle_scale_load.set(1.0);
+            subtitle_margin_load.set(96);
             play_btn.set_icon_name("media-playback-pause-symbolic");
             content_stack.set_visible_child_name("video");
             controls.set_visible(true);
@@ -247,6 +261,8 @@ pub fn wire(
         let subs_prefs = state.subtitles.clone();
         let subtitle_css_prefs = ui.subtitle_css.clone();
         let subtitle_label_prefs = ui.subtitle_label.clone();
+        let subtitle_scale_prefs = state.subtitle_scale.clone();
+        let subtitle_margin_prefs = state.subtitle_margin.clone();
         ui.settings_btn.connect_clicked(move |_| {
             // === General page ===
             let dev_group = adw::PreferencesGroup::builder()
@@ -344,8 +360,13 @@ pub fn wire(
             shortcuts_page.add(&sc_group);
 
             // === Subtitles + Mouse pages ===
-            let subtitles_page =
-                build_subtitles_page(&subs_prefs, &subtitle_css_prefs, &subtitle_label_prefs);
+            let subtitles_page = build_subtitles_page(
+                &subs_prefs,
+                &subtitle_css_prefs,
+                &subtitle_label_prefs,
+                &subtitle_scale_prefs,
+                &subtitle_margin_prefs,
+            );
             let mouse_page = build_mouse_page(&state_mouse);
 
             pref_window.add(&general_page);
@@ -648,9 +669,18 @@ pub fn wire(
 
     // ---------- Subtitles ----------
     install_subtitles(ui, pipe, state);
+
+    // ---------- Quick-settings drawer (Video / Audio / Subtitles) ----------
+    install_quick_settings(ui, pipe, state);
     // Apply the initial subtitle style to the label so it's styled from the
     // first cue (and reflects any persisted preferences).
-    apply_subtitle_style(&state.subtitles, &ui.subtitle_css, &ui.subtitle_label);
+    apply_subtitle_style(
+        &state.subtitles,
+        &ui.subtitle_css,
+        &ui.subtitle_label,
+        &state.subtitle_scale,
+        &state.subtitle_margin,
+    );
 
     // Restore the persisted volume onto the slider (its value-changed handler
     // applies it to the pipeline and updates the icon). Suppress the OSD for
@@ -695,6 +725,7 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
     let state_for_drag = state.clone();
     let subtitles = state.subtitles.clone();
     let subtitle_label = ui.subtitle_label.clone();
+    let subtitle_delay_ns = state.subtitle_delay_ns.clone();
 
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         let (_, gst_state, _) = pipeline.state(gst::ClockTime::ZERO);
@@ -758,7 +789,13 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
 
         if !state_for_drag.is_dragging_now() && !recent_seek && pos_ns > 0 {
             let stuck_playing = gst_state == gst::State::Playing && pos_ns == stall_state.get().0;
+            // Only network streams can stall in Paused waiting for their buffer
+            // to refill. A LOCAL file has no queue (q is always 0), so a Paused
+            // local file is just paused — never a stall. Treating it as one made
+            // the watchdog hard-reload in a loop (visible blinking), especially
+            // during the brief preroll after a Ready-cycle.
             let stuck_paused = gst_state == gst::State::Paused
+                && !is_local.get()
                 && queue_bytes_now == 0
                 && !user_paused.get();
 
@@ -815,8 +852,10 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
         if let Some(p) = pos {
             position_label.set_text(&format_time(p));
 
-            // Render the active external-subtitle cue (if any) in our label.
-            match subtitles.active_cue_text(p.nseconds()) {
+            // Render the active subtitle cue (if any) in our label, shifted by
+            // the user's subtitle delay (positive = subs appear later).
+            let lookup_ns = (p.nseconds() as i64 - subtitle_delay_ns.get()).max(0) as u64;
+            match subtitles.active_cue_text(lookup_ns) {
                 Some(text) => {
                     if subtitle_label.text() != text {
                         subtitle_label.set_text(&text);
@@ -1563,14 +1602,16 @@ fn apply_subtitle_style(
     subs: &crate::subtitles::Subtitles,
     css: &gtk::CssProvider,
     label: &gtk::Label,
+    scale: &Rc<Cell<f64>>,
+    margin: &Rc<Cell<i32>>,
 ) {
     use crate::subtitles::VAlign;
     let style = subs.style.lock().unwrap();
-    css.load_from_string(&crate::subtitles::subtitle_css(&style));
+    css.load_from_string(&crate::subtitles::subtitle_css(&style, scale.get()));
     match style.valign {
         VAlign::Bottom => {
             label.set_valign(gtk::Align::End);
-            label.set_margin_bottom(96);
+            label.set_margin_bottom(margin.get());
             label.set_margin_top(0);
         }
         VAlign::Top => {
@@ -1592,6 +1633,8 @@ fn build_subtitles_page(
     subs: &crate::subtitles::Subtitles,
     css: &gtk::CssProvider,
     label: &gtk::Label,
+    scale: &Rc<Cell<f64>>,
+    margin: &Rc<Cell<i32>>,
 ) -> adw::PreferencesPage {
     use crate::subtitles::VAlign;
 
@@ -1600,7 +1643,9 @@ fn build_subtitles_page(
         let subs = subs.clone();
         let css = css.clone();
         let label = label.clone();
-        move || apply_subtitle_style(&subs, &css, &label)
+        let scale = scale.clone();
+        let margin = margin.clone();
+        move || apply_subtitle_style(&subs, &css, &label, &scale, &margin)
     };
 
     // --- Font ---
@@ -2224,4 +2269,658 @@ fn run_action(
             }
         }
     }
+}
+
+// ===================== Quick-settings drawer (Video/Audio/Subtitles) =========
+
+/// Wire the gear toggle and (re)build the three tabbed pages on each open, so
+/// they always reflect the current track lists and live effect values.
+fn install_quick_settings(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
+    let stack = ui.settings_view_stack.clone();
+    let revealer = ui.settings_revealer.clone();
+    let pipeline = pipe.pipeline.clone();
+    let state = state.clone();
+    let ui_subs_css = ui.subtitle_css.clone();
+    let ui_subs_label = ui.subtitle_label.clone();
+
+    let rebuild = {
+        let stack = stack.clone();
+        let pipeline = pipeline.clone();
+        let state = state.clone();
+        let css = ui_subs_css.clone();
+        let label = ui_subs_label.clone();
+        move || {
+            while let Some(child) = stack.first_child() {
+                stack.remove(&child);
+            }
+            let video = build_video_qs_page(&pipeline, &state);
+            let audio = build_audio_qs_page(&pipeline, &state);
+            let subs = build_subtitle_qs_page(&pipeline, &state, &css, &label);
+            stack.add_titled_with_icon(&video, Some("video"), "Video", "video-display-symbolic");
+            stack.add_titled_with_icon(&audio, Some("audio"), "Audio", "audio-volume-high-symbolic");
+            stack.add_titled_with_icon(
+                &subs,
+                Some("subtitles"),
+                "Subtitles",
+                "media-view-subtitles-symbolic",
+            );
+        }
+    };
+
+    {
+        let revealer = revealer.clone();
+        ui.settings_panel_btn.connect_clicked(move |_| {
+            if revealer.reveals_child() {
+                revealer.set_reveal_child(false);
+            } else {
+                rebuild();
+                revealer.set_reveal_child(true);
+            }
+        });
+    }
+    {
+        let revealer = revealer.clone();
+        ui.settings_close_btn.connect_clicked(move |_| revealer.set_reveal_child(false));
+    }
+
+    // Click anywhere on the video (outside the drawer) to dismiss it. A
+    // capture-phase gesture runs before the play/pause click and claims the
+    // press when it closes, so dismissing doesn't also toggle playback. Clicks
+    // on the drawer itself go to its own widgets and never reach here.
+    {
+        let revealer = revealer.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(gdk::BUTTON_PRIMARY);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(move |g, _, _, _| {
+            if revealer.reveals_child() {
+                revealer.set_reveal_child(false);
+                g.set_state(gtk::EventSequenceState::Claimed);
+            }
+        });
+        ui.picture.add_controller(click);
+    }
+}
+
+// ---- small builders ----
+
+/// An ActionRow with a horizontal slider in its suffix.
+fn qs_slider(title: &str, min: f64, max: f64, step: f64, value: f64) -> (adw::ActionRow, gtk::Scale) {
+    let row = adw::ActionRow::builder().title(title).build();
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
+    scale.set_value(value.clamp(min, max));
+    scale.set_hexpand(true);
+    scale.set_size_request(150, -1);
+    scale.set_draw_value(false);
+    scale.set_valign(gtk::Align::Center);
+    row.add_suffix(&scale);
+    (row, scale)
+}
+
+/// A small reset button that snaps a scale back to `default`.
+fn qs_reset(scale: &gtk::Scale, default: f64) -> gtk::Button {
+    let btn = gtk::Button::from_icon_name("edit-undo-symbolic");
+    btn.add_css_class("flat");
+    btn.set_valign(gtk::Align::Center);
+    btn.set_tooltip_text(Some("Reset"));
+    let scale = scale.clone();
+    btn.connect_clicked(move |_| scale.set_value(default));
+    btn
+}
+
+fn qs_string_model(items: &[String]) -> gtk::StringList {
+    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+    gtk::StringList::new(&refs)
+}
+
+/// Toggle a `GstPlayFlags` token on the playbin (e.g. "video"/"audio"/
+/// "deinterlace"), keeping the shared flags string in sync.
+fn toggle_play_flag(pipeline: &gst::Element, subs: &crate::subtitles::Subtitles, token: &str, on: bool) {
+    let new = {
+        let cur = subs.flags.borrow();
+        let mut parts: Vec<&str> = cur.split('+').filter(|p| *p != token).collect();
+        if on {
+            parts.push(token);
+        }
+        parts.join("+")
+    };
+    *subs.flags.borrow_mut() = new.clone();
+    let _ = pipeline.set_property_from_str("flags", &new);
+}
+
+/// Position-preserving reload (Ready→Playing); the AsyncDone bus handler seeks
+/// back to `pending_restore_pos`.
+fn qs_reload_pipeline(pipeline: &gst::Element, state: &AppState) {
+    if let Some(pos) = pipeline.query_position::<gst::ClockTime>() {
+        state.pending_restore_pos.set(Some(pos.nseconds()));
+    }
+    pipeline.set_state(gst::State::Ready).ok();
+    let pl = pipeline.clone();
+    glib::idle_add_local_once(move || {
+        pl.set_state(gst::State::Playing).ok();
+    });
+}
+
+/// Raise/lower the rank of common hardware decoder factories so playbin's
+/// autoplug prefers software decoders when HW decoding is switched off.
+fn set_hw_decoders_enabled(on: bool) {
+    let registry = gst::Registry::get();
+    const HW: &[&str] = &[
+        "nvh264dec", "nvh265dec", "nvh264sldec", "nvh265sldec", "nvav1dec", "nvvp8dec",
+        "nvvp9dec", "nvmpeg2videodec", "nvmpeg4videodec", "vah264dec", "vah265dec", "vavp9dec",
+        "vaav1dec", "vaapidecodebin", "vaapih264dec", "vaapih265dec", "v4l2h264dec",
+        "v4l2h265dec", "v4l2slh264dec", "msdkh264dec",
+    ];
+    let rank = if on { gst::Rank::PRIMARY } else { gst::Rank::NONE };
+    for name in HW {
+        if let Some(f) = registry.lookup_feature(name) {
+            f.set_rank(rank);
+        }
+    }
+}
+
+/// The negotiated source video width/height, or (0, 0) if not yet known.
+fn source_video_size(pipeline: &gst::Element) -> (i32, i32) {
+    let pad = pipeline.emit_by_name::<Option<gst::Pad>>("get-video-pad", &[&0i32]);
+    if let Some(pad) = pad
+        && let Some(caps) = pad.current_caps()
+        && let Some(s) = caps.structure(0)
+    {
+        return (
+            s.get::<i32>("width").unwrap_or(0),
+            s.get::<i32>("height").unwrap_or(0),
+        );
+    }
+    (0, 0)
+}
+
+fn qs_tag_label(tags: &Option<gst::TagList>, idx: i32, kind: &str) -> String {
+    if let Some(t) = tags {
+        if let Some(v) = t.get::<gst::tags::Title>() {
+            return v.get().to_string();
+        }
+        if let Some(v) = t.get::<gst::tags::LanguageName>() {
+            return v.get().to_string();
+        }
+        if let Some(v) = t.get::<gst::tags::LanguageCode>() {
+            return v.get().to_string();
+        }
+    }
+    format!("{kind} {}", idx + 1)
+}
+
+fn qs_tracks(pipeline: &gst::Element, n_prop: &str, tags_signal: &str, kind: &str) -> Vec<String> {
+    let n: i32 = pipeline.property(n_prop);
+    (0..n)
+        .map(|i| {
+            let tags = pipeline.emit_by_name::<Option<gst::TagList>>(tags_signal, &[&i]);
+            qs_tag_label(&tags, i, kind)
+        })
+        .collect()
+}
+
+// ---- Video page ----
+
+fn build_video_qs_page(pipeline: &gst::Element, state: &AppState) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let effects = state.effects.clone();
+
+    // Track
+    let track_group = adw::PreferencesGroup::builder().title("Video track").build();
+    let mut items = vec!["None".to_string()];
+    items.extend(qs_tracks(pipeline, "n-video", "get-video-tags", "Video"));
+    let cur: i32 = pipeline.property("current-video");
+    let track_row = adw::ComboRow::builder()
+        .title("Track")
+        .model(&qs_string_model(&items))
+        .build();
+    track_row.set_selected((cur + 1).max(0) as u32);
+    {
+        let pipeline = pipeline.clone();
+        let subs = state.subtitles.clone();
+        track_row.connect_selected_notify(move |row| {
+            let sel = row.selected() as i32;
+            if sel <= 0 {
+                toggle_play_flag(&pipeline, &subs, "video", false);
+            } else {
+                toggle_play_flag(&pipeline, &subs, "video", true);
+                pipeline.set_property("current-video", sel - 1);
+            }
+        });
+    }
+    track_group.add(&track_row);
+    page.add(&track_group);
+
+    // Geometry
+    let geo = adw::PreferencesGroup::builder().title("Geometry").build();
+
+    let aspect_items: Vec<String> = AspectMode::ALL.iter().map(|m| m.label().to_string()).collect();
+    let aspect_row = adw::ComboRow::builder()
+        .title("Aspect ratio")
+        .model(&qs_string_model(&aspect_items))
+        .build();
+    aspect_row.set_selected(
+        AspectMode::ALL.iter().position(|m| *m == effects.aspect.get()).unwrap_or(0) as u32,
+    );
+    {
+        let effects = effects.clone();
+        aspect_row.connect_selected_notify(move |row| {
+            effects.set_aspect(AspectMode::ALL[row.selected() as usize]);
+        });
+    }
+    geo.add(&aspect_row);
+
+    let crop_items: Vec<String> = AspectMode::ALL
+        .iter()
+        .map(|m| if *m == AspectMode::Default { "None".to_string() } else { m.label().to_string() })
+        .collect();
+    let crop_row = adw::ComboRow::builder()
+        .title("Crop")
+        .model(&qs_string_model(&crop_items))
+        .build();
+    crop_row.set_selected(
+        AspectMode::ALL.iter().position(|m| *m == effects.crop_mode.get()).unwrap_or(0) as u32,
+    );
+    {
+        let effects = effects.clone();
+        let pipeline = pipeline.clone();
+        crop_row.connect_selected_notify(move |row| {
+            let (w, h) = source_video_size(&pipeline);
+            effects.set_crop(AspectMode::ALL[row.selected() as usize], w, h);
+        });
+    }
+    geo.add(&crop_row);
+
+    let rot_items: Vec<String> = ["0°", "90°", "180°", "270°"].iter().map(|s| s.to_string()).collect();
+    let rot_row = adw::ComboRow::builder()
+        .title("Rotation")
+        .model(&qs_string_model(&rot_items))
+        .build();
+    rot_row.set_selected(match effects.rotation.get() {
+        90 => 1,
+        180 => 2,
+        270 => 3,
+        _ => 0,
+    });
+    {
+        let effects = effects.clone();
+        rot_row.connect_selected_notify(move |row| {
+            effects.set_rotation([0u16, 90, 180, 270][row.selected() as usize]);
+        });
+    }
+    geo.add(&rot_row);
+    page.add(&geo);
+
+    // Speed
+    let speed_group = adw::PreferencesGroup::builder().title("Speed").build();
+    let (speed_row, speed_scale) = qs_slider("Playback speed", 0.25, 16.0, 0.05, effects.speed.get());
+    speed_scale.set_draw_value(true);
+    speed_scale.set_value_pos(gtk::PositionType::Left);
+    {
+        let effects = effects.clone();
+        let pipeline = pipeline.clone();
+        let state = state.clone();
+        speed_scale.connect_value_changed(move |s| {
+            effects.speed.set(s.value());
+            let pos = pipeline
+                .query_position::<gst::ClockTime>()
+                .map(|p| p.nseconds())
+                .unwrap_or(0);
+            state.request_seek(&pipeline, pos);
+        });
+    }
+    speed_row.add_suffix(&qs_reset(&speed_scale, 1.0));
+    speed_group.add(&speed_row);
+    page.add(&speed_group);
+
+    // Decoding
+    let dec = adw::PreferencesGroup::builder().title("Decoding").build();
+    let hw_row = adw::SwitchRow::builder().title("Hardware decoding").active(true).build();
+    {
+        let pipeline = pipeline.clone();
+        let state = state.clone();
+        hw_row.connect_active_notify(move |row| {
+            set_hw_decoders_enabled(row.is_active());
+            qs_reload_pipeline(&pipeline, &state);
+        });
+    }
+    dec.add(&hw_row);
+
+    let deint_on = state.subtitles.flags.borrow().split('+').any(|p| p == "deinterlace");
+    let deint_row = adw::SwitchRow::builder().title("Deinterlace").active(deint_on).build();
+    {
+        let pipeline = pipeline.clone();
+        let subs = state.subtitles.clone();
+        deint_row.connect_active_notify(move |row| {
+            toggle_play_flag(&pipeline, &subs, "deinterlace", row.is_active());
+        });
+    }
+    dec.add(&deint_row);
+    page.add(&dec);
+
+    // Color equalizer
+    let color = adw::PreferencesGroup::builder().title("Equalizer").build();
+    let seed = |slot: &Arc<Mutex<Option<gst::Element>>>, prop: &str, default: f64| -> f64 {
+        slot.lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.property::<f64>(prop)))
+            .unwrap_or(default)
+    };
+    let add_color = |group: &adw::PreferencesGroup,
+                     title: &str,
+                     min: f64,
+                     max: f64,
+                     value: f64,
+                     default: f64,
+                     apply: Box<dyn Fn(f64)>| {
+        let (row, scale) = qs_slider(title, min, max, (max - min) / 200.0, value);
+        scale.connect_value_changed(move |s| apply(s.value()));
+        row.add_suffix(&qs_reset(&scale, default));
+        group.add(&row);
+    };
+    add_color(&color, "Brightness", -1.0, 1.0, seed(&effects.videobalance, "brightness", 0.0), 0.0, {
+        let e = effects.clone();
+        Box::new(move |v| e.set_brightness(v))
+    });
+    add_color(&color, "Contrast", 0.0, 2.0, seed(&effects.videobalance, "contrast", 1.0), 1.0, {
+        let e = effects.clone();
+        Box::new(move |v| e.set_contrast(v))
+    });
+    add_color(&color, "Saturation", 0.0, 2.0, seed(&effects.videobalance, "saturation", 1.0), 1.0, {
+        let e = effects.clone();
+        Box::new(move |v| e.set_saturation(v))
+    });
+    add_color(&color, "Gamma", 0.1, 4.0, seed(&effects.gamma, "gamma", 1.0), 1.0, {
+        let e = effects.clone();
+        Box::new(move |v| e.set_gamma(v))
+    });
+    add_color(&color, "Hue", -1.0, 1.0, seed(&effects.videobalance, "hue", 0.0), 0.0, {
+        let e = effects.clone();
+        Box::new(move |v| e.set_hue(v))
+    });
+    page.add(&color);
+
+    page
+}
+
+// ---- Audio page ----
+
+fn build_audio_qs_page(pipeline: &gst::Element, state: &AppState) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let effects = state.effects.clone();
+
+    // Track
+    let track_group = adw::PreferencesGroup::builder().title("Audio track").build();
+    let mut items = vec!["None".to_string()];
+    items.extend(qs_tracks(pipeline, "n-audio", "get-audio-tags", "Audio"));
+    let cur: i32 = pipeline.property("current-audio");
+    let track_row = adw::ComboRow::builder()
+        .title("Track")
+        .model(&qs_string_model(&items))
+        .build();
+    track_row.set_selected((cur + 1).max(0) as u32);
+    {
+        let pipeline = pipeline.clone();
+        let subs = state.subtitles.clone();
+        track_row.connect_selected_notify(move |row| {
+            let sel = row.selected() as i32;
+            if sel <= 0 {
+                toggle_play_flag(&pipeline, &subs, "audio", false);
+            } else {
+                toggle_play_flag(&pipeline, &subs, "audio", true);
+                pipeline.set_property("current-audio", sel - 1);
+            }
+        });
+    }
+    track_group.add(&track_row);
+    page.add(&track_group);
+
+    // Delay
+    let delay_group = adw::PreferencesGroup::builder().title("Audio delay").build();
+    let cur_delay = effects.av_offset_ns.get() as f64 / 1e9;
+    let (delay_row, delay_scale) = qs_slider("Delay (s)", -5.0, 5.0, 0.05, cur_delay);
+    delay_scale.set_draw_value(true);
+    delay_scale.set_value_pos(gtk::PositionType::Left);
+    {
+        let effects = effects.clone();
+        let pipeline = pipeline.clone();
+        delay_scale.connect_value_changed(move |s| {
+            effects.set_av_offset(&pipeline, (s.value() * 1e9) as i64);
+        });
+    }
+    delay_row.add_suffix(&qs_reset(&delay_scale, 0.0));
+    delay_group.add(&delay_row);
+    page.add(&delay_group);
+
+    // 10-band equalizer
+    let eq_group = adw::PreferencesGroup::builder().title("Equalizer").build();
+    const FREQS: [&str; 10] = ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+
+    let preset_items: Vec<String> = EQ_PRESETS
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .chain(std::iter::once("Manual".to_string()))
+        .collect();
+    let manual_idx = EQ_PRESETS.len() as u32;
+    let preset_row = adw::ComboRow::builder()
+        .title("Preset")
+        .model(&qs_string_model(&preset_items))
+        .build();
+    preset_row.set_selected(manual_idx);
+    eq_group.add(&preset_row);
+
+    let suppress = Rc::new(Cell::new(false));
+    let mut band_scales: Vec<gtk::Scale> = Vec::with_capacity(10);
+    for (i, freq) in FREQS.iter().enumerate() {
+        let seed = effects
+            .equalizer
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.property::<f64>(format!("band{i}").as_str())))
+            .unwrap_or(0.0);
+        let (row, scale) = qs_slider(&format!("{freq} Hz"), -12.0, 12.0, 0.5, seed);
+        {
+            let effects = effects.clone();
+            let suppress = suppress.clone();
+            let preset_row = preset_row.clone();
+            scale.connect_value_changed(move |s| {
+                effects.set_eq_band(i, s.value());
+                if !suppress.get() {
+                    preset_row.set_selected(manual_idx);
+                }
+            });
+        }
+        eq_group.add(&row);
+        band_scales.push(scale);
+    }
+    {
+        let suppress = suppress.clone();
+        preset_row.connect_selected_notify(move |row| {
+            let idx = row.selected() as usize;
+            if idx < EQ_PRESETS.len() {
+                suppress.set(true);
+                for (i, scale) in band_scales.iter().enumerate() {
+                    scale.set_value(EQ_PRESETS[idx].1[i]);
+                }
+                suppress.set(false);
+            }
+        });
+    }
+    page.add(&eq_group);
+
+    page
+}
+
+// ---- Subtitle page ----
+
+fn build_subtitle_qs_page(
+    pipeline: &gst::Element,
+    state: &AppState,
+    css: &gtk::CssProvider,
+    label: &gtk::Label,
+) -> adw::PreferencesPage {
+    use crate::subtitles::Active;
+    let page = adw::PreferencesPage::new();
+    let subs = state.subtitles.clone();
+
+    let apply = {
+        let subs = subs.clone();
+        let css = css.clone();
+        let label = label.clone();
+        let scale = state.subtitle_scale.clone();
+        let margin = state.subtitle_margin.clone();
+        Rc::new(move || apply_subtitle_style(&subs, &css, &label, &scale, &margin))
+    };
+
+    // Track selection (Off / embedded / external).
+    let track_group = adw::PreferencesGroup::builder().title("Subtitle track").build();
+    let mut items = vec!["Off".to_string()];
+    let embedded = subs.embedded_tracks(pipeline);
+    let mut mapping: Vec<Active> = vec![Active::Off];
+    for (idx, lbl) in &embedded {
+        items.push(lbl.clone());
+        mapping.push(Active::Embedded(*idx));
+    }
+    for (i, ext) in subs.externals.borrow().iter().enumerate() {
+        items.push(ext.name.clone());
+        mapping.push(Active::External(i));
+    }
+    let cur_active = *subs.active.borrow();
+    let sel = mapping
+        .iter()
+        .position(|a| match (a, cur_active) {
+            (Active::Off, Active::Off) => true,
+            (Active::Embedded(x), Active::Embedded(y)) => *x == y,
+            (Active::External(x), Active::External(y)) => *x == y,
+            _ => false,
+        })
+        .unwrap_or(0);
+    let track_row = adw::ComboRow::builder()
+        .title("Track")
+        .model(&qs_string_model(&items))
+        .build();
+    track_row.set_selected(sel as u32);
+    {
+        let pipeline = pipeline.clone();
+        let subs = subs.clone();
+        track_row.connect_selected_notify(move |row| {
+            match mapping.get(row.selected() as usize).copied().unwrap_or(Active::Off) {
+                Active::Off => subs.set_off(&pipeline),
+                Active::Embedded(i) => subs.set_embedded(&pipeline, i),
+                Active::External(i) => subs.set_external(&pipeline, i),
+            }
+        });
+    }
+    track_group.add(&track_row);
+    page.add(&track_group);
+
+    // Timing & geometry
+    let timing = adw::PreferencesGroup::builder().title("Timing & position").build();
+
+    let (delay_row, delay_scale) =
+        qs_slider("Delay (s)", -10.0, 10.0, 0.1, state.subtitle_delay_ns.get() as f64 / 1e9);
+    delay_scale.set_draw_value(true);
+    delay_scale.set_value_pos(gtk::PositionType::Left);
+    {
+        let delay = state.subtitle_delay_ns.clone();
+        delay_scale.connect_value_changed(move |s| delay.set((s.value() * 1e9) as i64));
+    }
+    delay_row.add_suffix(&qs_reset(&delay_scale, 0.0));
+    timing.add(&delay_row);
+
+    let (pos_row, pos_scale) =
+        qs_slider("Position", 0.0, 300.0, 4.0, state.subtitle_margin.get() as f64);
+    {
+        let margin = state.subtitle_margin.clone();
+        let apply = apply.clone();
+        pos_scale.connect_value_changed(move |s| {
+            margin.set(s.value() as i32);
+            apply();
+        });
+    }
+    pos_row.add_suffix(&qs_reset(&pos_scale, 96.0));
+    timing.add(&pos_row);
+
+    let (scale_row, scale_scale) = qs_slider("Scale", 0.5, 3.0, 0.05, state.subtitle_scale.get());
+    scale_scale.set_draw_value(true);
+    scale_scale.set_value_pos(gtk::PositionType::Left);
+    {
+        let scale = state.subtitle_scale.clone();
+        let apply = apply.clone();
+        scale_scale.connect_value_changed(move |s| {
+            scale.set(s.value());
+            apply();
+        });
+    }
+    scale_row.add_suffix(&qs_reset(&scale_scale, 1.0));
+    timing.add(&scale_row);
+    page.add(&timing);
+
+    // Text style (mutates the global SubtitleStyle)
+    let style_group = adw::PreferencesGroup::builder().title("Text style").build();
+
+    let color_row = adw::ActionRow::builder().title("Text color").build();
+    let color_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    color_btn.set_valign(gtk::Align::Center);
+    color_btn.set_rgba(&argb_to_rgba(subs.style.lock().unwrap().color));
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        color_btn.connect_rgba_notify(move |b| {
+            subs.style.lock().unwrap().color = rgba_to_argb(&b.rgba());
+            apply();
+        });
+    }
+    color_row.add_suffix(&color_btn);
+    style_group.add(&color_row);
+
+    let outline_row = adw::ActionRow::builder().title("Outline color").build();
+    let outline_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    outline_btn.set_valign(gtk::Align::Center);
+    outline_btn.set_rgba(&argb_to_rgba(subs.style.lock().unwrap().outline_color));
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        outline_btn.connect_rgba_notify(move |b| {
+            subs.style.lock().unwrap().outline_color = rgba_to_argb(&b.rgba());
+            apply();
+        });
+    }
+    outline_row.add_suffix(&outline_btn);
+    style_group.add(&outline_row);
+
+    let (width_row, width_scale) =
+        qs_slider("Outline width", 0.0, 6.0, 0.5, subs.style.lock().unwrap().outline_width as f64);
+    width_scale.set_draw_value(true);
+    width_scale.set_value_pos(gtk::PositionType::Left);
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        width_scale.connect_value_changed(move |s| {
+            let mut st = subs.style.lock().unwrap();
+            st.outline_width = s.value() as f32;
+            st.draw_outline = s.value() > 0.0;
+            drop(st);
+            apply();
+        });
+    }
+    width_row.add_suffix(&qs_reset(&width_scale, 2.0));
+    style_group.add(&width_row);
+
+    let bg_row = adw::SwitchRow::builder()
+        .title("Shaded background")
+        .active(subs.style.lock().unwrap().shaded_background)
+        .build();
+    {
+        let subs = subs.clone();
+        let apply = apply.clone();
+        bg_row.connect_active_notify(move |r| {
+            subs.style.lock().unwrap().shaded_background = r.is_active();
+            apply();
+        });
+    }
+    style_group.add(&bg_row);
+    page.add(&style_group);
+
+    page
 }
