@@ -10,3 +10,9 @@ Categories=AudioVideo;Player;Video;GTK;
 MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/x-flv;video/3gpp;video/ogg;
 Keywords=video;movie;media;player;film;
 StartupNotify=true
+StartupWMClass=io.github.alisp.Soniq
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=soniq

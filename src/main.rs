@@ -38,9 +38,14 @@ fn main() -> glib::ExitCode {
 
     // HANDLES_OPEN so file-manager "Open With Soniq" and `soniq file.mp4`
     // deliver the file(s) to us via the `open` signal.
+    //
+    // NON_UNIQUE drops GApplication's default single-instance behaviour: every
+    // launch becomes its own process with its own window and playback pipeline,
+    // so the user can run several copies of Soniq side by side. Without it a
+    // second launch would just be forwarded to the first process.
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     // The window + its load_file closure are built lazily on the first

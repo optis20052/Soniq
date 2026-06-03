@@ -315,7 +315,21 @@ pub fn wire(
         let subtitle_margin_prefs = state.subtitle_margin.clone();
         let resume_mode_prefs = state.resume_mode.clone();
         let show_fps_prefs = state.show_fps.clone();
+        // Track the currently-open preferences window so repeated clicks bring
+        // the existing one to the front instead of stacking new copies.
+        let open_pref_window: Rc<RefCell<Option<glib::WeakRef<adw::PreferencesWindow>>>> =
+            Rc::new(RefCell::new(None));
         ui.settings_btn.connect_clicked(move |_| {
+            // If a preferences window is already open, just present it again.
+            if let Some(existing) = open_pref_window
+                .borrow()
+                .as_ref()
+                .and_then(|weak| weak.upgrade())
+            {
+                existing.present();
+                return;
+            }
+
             // === General page ===
             let dev_group = adw::PreferencesGroup::builder()
                 .title("Developer")
@@ -392,6 +406,17 @@ pub fn wire(
                 .default_height(560)
                 .modal(false)
                 .build();
+
+            // Remember this window and clear the slot once it closes so the
+            // next click can create a fresh one.
+            *open_pref_window.borrow_mut() = Some(pref_window.downgrade());
+            {
+                let open_pref_window = open_pref_window.clone();
+                pref_window.connect_close_request(move |_| {
+                    *open_pref_window.borrow_mut() = None;
+                    Propagation::Proceed
+                });
+            }
 
             for &action in crate::shortcuts::Action::all() {
                 let row = adw::ActionRow::builder()
