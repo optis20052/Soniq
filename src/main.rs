@@ -4,6 +4,7 @@ mod handlers;
 mod osd;
 mod pipeline;
 mod resume;
+mod shine;
 mod shortcuts;
 mod state;
 mod subtitles;

@@ -357,10 +357,12 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     actions_row.append(&action_open);
     actions_row.append(&action_url);
 
-    // Left column: branding + actions.
-    let brand_logo = gtk::Image::from_icon_name(crate::WORDMARK_ICON);
-    brand_logo.set_pixel_size(112);
-    brand_logo.add_css_class("home-logo");
+    // Left column: branding + actions. The logo carries a diagonal shine streak
+    // that sweeps corner-to-corner across the glyph (custom widget that masks a
+    // moving gradient to the logo's shape).
+    let brand_logo = crate::shine::ShineLogo::new();
+    brand_logo.set_halign(gtk::Align::Center);
+    brand_logo.set_can_target(false);
 
     let brand_title = gtk::Label::new(Some("Soniq"));
     brand_title.add_css_class("home-title");
@@ -640,7 +642,7 @@ const CSS: &str = "
 
     .empty-state { background-color: #0a0a0c; padding: 24px 28px; }
     .empty-state > * { color: rgba(255, 255, 255, 0.92); }
-    .home-logo { color: rgba(255, 255, 255, 0.82); }
+    /* The logo + its shine sweep are drawn by the ShineLogo widget. */
     .home-title { color: rgba(255, 255, 255, 0.95); font-weight: 800; font-size: 2.0em; }
     .home-desc { color: rgba(255, 255, 255, 0.55); }
     .empty-state button.pill {
