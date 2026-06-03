@@ -755,29 +755,6 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
             })
             .unwrap_or(0);
 
-        let downloaded_bytes: u64 = {
-            let mut bq = gst::query::Buffering::new(gst::Format::Bytes);
-            if pipeline.query(bq.query_mut()) {
-                let (_s, stop, _t) = bq.range();
-                if let gst::GenericFormattedValue::Bytes(Some(b)) = stop {
-                    *b
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        };
-        let total_bytes_src: u64 = source_ref
-            .lock()
-            .ok()
-            .and_then(|s| {
-                s.as_ref()
-                    .and_then(|e| e.query_duration::<gst::format::Bytes>())
-            })
-            .map(|b| *b)
-            .unwrap_or(0);
-
         let pos_ns = pos.map(|p| p.nseconds()).unwrap_or(0);
         // Grace after a seek: long enough for normal HW-decoder seek latency,
         // short enough that a real post-seek freeze recovers quickly.
