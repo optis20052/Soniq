@@ -1139,45 +1139,66 @@ fn install_overlay_chrome(ui: &UiHandles) {
     // so video clicks aren't affected.
     if let Some(overlay) = ui.controls.parent() {
         let drag = gtk::GestureDrag::new();
-        // grab = pointer offset from the bar's top-left at drag start.
-        let grab = Rc::new(Cell::new(None::<(f64, f64)>));
+        // Default gap the centered bar keeps from the window bottom.
+        const DEFAULT_BOTTOM: i32 = 8;
+        // base = the bar's top-left (overlay coords) at drag start. We position
+        // purely by adding the gesture's *offset* (which is reliable) to this
+        // base, so we never read a widget's absolute x/y — those are unreliable
+        // in GTK4 (allocation()/compute_bounds() can report 0 here) and were
+        // making the bar jump to the top on the first move.
+        let base = Rc::new(Cell::new(None::<(f64, f64)>));
         let controls = ui.controls.clone();
         {
-            let grab = grab.clone();
+            let base = base.clone();
             let controls = controls.clone();
             drag.connect_drag_begin(move |g, x, y| {
-                let a = controls.allocation();
-                let inside = x >= a.x() as f64
-                    && x <= (a.x() + a.width()) as f64
-                    && y >= a.y() as f64
-                    && y <= (a.y() + a.height()) as f64;
-                if inside {
-                    grab.set(Some((x - a.x() as f64, y - a.y() as f64)));
+                let Some(parent) = controls.parent() else {
+                    base.set(None);
+                    g.set_state(gtk::EventSequenceState::Denied);
+                    return;
+                };
+                // True current size (compute_bounds); width()/height() lag a
+                // layout cycle when the bar flips to drag mode, which shrinks
+                // the hit-test region and drops the first click.
+                let (bar_w, bar_h) = bar_size(&controls, &parent);
+                // The bar's current top-left, derived from layout rather than a
+                // (flaky) absolute position read.
+                let (bx, by) = if controls.halign() == gtk::Align::Start {
+                    (controls.margin_start(), controls.margin_top())
                 } else {
-                    grab.set(None);
+                    (
+                        (parent.width() - bar_w) / 2,
+                        parent.height() - bar_h - DEFAULT_BOTTOM,
+                    )
+                };
+                let inside = x >= bx as f64
+                    && x <= (bx + bar_w) as f64
+                    && y >= by as f64
+                    && y <= (by + bar_h) as f64;
+                if inside {
+                    base.set(Some((bx as f64, by as f64)));
+                } else {
+                    base.set(None);
                     g.set_state(gtk::EventSequenceState::Denied);
                 }
             });
         }
         {
-            let grab = grab.clone();
+            let base = base.clone();
             let controls = controls.clone();
-            drag.connect_drag_update(move |g, off_x, off_y| {
-                let Some((gx, gy)) = grab.get() else { return };
-                let Some((sx, sy)) = g.start_point() else { return };
-                // Current pointer position in stationary overlay coords.
-                let px = sx + off_x;
-                let py = sy + off_y;
-                let mut nx = (px - gx) as i32;
-                let mut ny = (py - gy) as i32;
+            drag.connect_drag_update(move |_g, off_x, off_y| {
+                let Some((bx, by)) = base.get() else { return };
+                let mut nx = (bx + off_x) as i32;
+                let mut ny = (by + off_y) as i32;
                 // Switch to absolute positioning on first move.
                 controls.set_halign(gtk::Align::Start);
                 controls.set_valign(gtk::Align::Start);
                 controls.set_margin_bottom(0);
                 if let Some(parent) = controls.parent() {
-                    const INSET: i32 = 10; // keep a margin from the window edges
-                    let max_x = (parent.width() - controls.width() - INSET).max(INSET);
-                    let max_y = (parent.height() - controls.height() - INSET).max(INSET);
+                    const INSET: i32 = 8; // keep a comfortable margin from the window edges
+                    let (bar_w, bar_h) = bar_size(&controls, &parent);
+                    let max_x = (parent.width() - bar_w - INSET).max(INSET);
+                    let max_y = (parent.height() - bar_h - INSET).max(INSET);
                     nx = nx.clamp(INSET, max_x);
                     ny = ny.clamp(INSET, max_y);
                 }
@@ -1193,14 +1214,16 @@ fn install_overlay_chrome(ui: &UiHandles) {
     // size-allocate signals.
     {
         let controls = ui.controls.clone();
+        let seek_scale = ui.seek_scale.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-            // Only when in dragged/absolute mode (halign switched to Start).
-            if controls.halign() == gtk::Align::Start
-                && let Some(parent) = controls.parent()
-            {
-                const INSET: i32 = 10;
-                let cw = controls.width();
-                let ch = controls.height();
+            let Some(parent) = controls.parent() else {
+                return ControlFlow::Continue;
+            };
+            const INSET: i32 = 8;
+
+            if controls.halign() == gtk::Align::Start {
+                // Dragged/absolute mode: keep it inside the window.
+                let (cw, ch) = bar_size(&controls, &parent);
                 // If the bar no longer fits the window, snap back to the
                 // default centered-bottom position so it can't overflow.
                 if cw + 2 * INSET > parent.width() || ch + 2 * INSET > parent.height() {
@@ -1208,7 +1231,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
                     controls.set_valign(gtk::Align::End);
                     controls.set_margin_start(0);
                     controls.set_margin_top(0);
-                    controls.set_margin_bottom(28);
+                    controls.set_margin_bottom(8);
                 } else {
                     let max_x = (parent.width() - cw - INSET).max(INSET);
                     let max_y = (parent.height() - ch - INSET).max(INSET);
@@ -1221,6 +1244,20 @@ fn install_overlay_chrome(ui: &UiHandles) {
                         controls.set_margin_top(ny);
                     }
                 }
+            } else {
+                // Default centered mode. The bar hugs its content (so its side
+                // margins are always symmetric); we cap the seek scale's width
+                // so the whole bar fits the window with a comfortable gutter
+                // on each side instead of running into the edges.
+                const SIDE_GUTTER: i32 = 8; // min gap from each window edge
+                // Width of the seek row's fixed chrome (time labels + spacing +
+                // the bar's horizontal padding) — everything except the scale.
+                const SEEK_ROW_CHROME: i32 = 130;
+                let avail = parent.width() - 2 * SIDE_GUTTER - SEEK_ROW_CHROME;
+                let target = avail.clamp(140, 340);
+                if seek_scale.width_request() != target {
+                    seek_scale.set_width_request(target);
+                }
             }
             ControlFlow::Continue
         });
@@ -1228,6 +1265,18 @@ fn install_overlay_chrome(ui: &UiHandles) {
 
     // Reveal initially.
     bump();
+}
+
+/// The control bar's true on-screen size in `parent` coordinates. GTK4's
+/// `width()`/`height()` lag a layout cycle when the bar flips between centered
+/// and dragged mode (reporting the previous, smaller allocation), which makes
+/// edge-clamping overflow and shrinks the drag hit-test region. `compute_bounds`
+/// reports the current size, so prefer it and fall back to the allocation.
+fn bar_size(controls: &gtk::Box, parent: &gtk::Widget) -> (i32, i32) {
+    controls
+        .compute_bounds(parent)
+        .map(|b| (b.width().ceil() as i32, b.height().ceil() as i32))
+        .unwrap_or_else(|| (controls.width(), controls.height()))
 }
 
 /// Video file extensions we treat as playable for folder navigation.

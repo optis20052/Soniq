@@ -191,7 +191,10 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     title_label.add_css_class("title");
     title_label.set_xalign(0.0);
     title_label.set_hexpand(false);
-    title_label.set_max_width_chars(26);
+    // Fixed width (both bounds equal) so the bar's overall width stays constant
+    // regardless of the title text — keeps drag-edge clamping consistent.
+    title_label.set_width_chars(16);
+    title_label.set_max_width_chars(16);
     title_label.set_ellipsize(pango::EllipsizeMode::End);
 
     let volume_btn = gtk::Button::from_icon_name("audio-volume-high-symbolic");
@@ -242,17 +245,20 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     row_bot.append(&subtitle_btn);
     row_bot.append(&volume_box);
     row_bot.append(&fullscreen_btn);
+    // Keep the buttons clustered in the centre of the (stretchable) bar.
+    row_bot.set_halign(gtk::Align::Center);
 
     // Compact, centered, floating bar (IINA-style). It hugs its content and
-    // sits near the bottom; the seek scale has a fixed natural width so the
-    // whole bar stays a sensible compact size instead of spanning the window.
-    seek_scale.set_width_request(300);
+    // sits centered near the bottom, so its side margins are always symmetric.
+    // The seek scale's width is capped responsively in handlers.rs so the whole
+    // bar always fits the window with breathing room instead of overflowing.
+    seek_scale.set_width_request(340);
     let controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::End)
-        .margin_bottom(28)
+        .margin_bottom(8)
         .build();
     controls.add_css_class("controls-bar");
     controls.append(&row_top);
