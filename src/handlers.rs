@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -106,6 +106,14 @@ pub fn wire(
             *current_uri_load.borrow_mut() = Some(uri.to_string());
             effects_load.reset_for_new_video(&pipeline);
             subtitle_delay_load.set(0);
+
+            // Add/refresh this file in the watch history (for "recently
+            // played"), with a friendly display title.
+            let title = file
+                .basename()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| uri.to_string());
+            resume_store_load.note_open(uri.as_str(), &title);
 
             // Resume: if this file was watched before, either auto-seek
             // (Always) or offer a banner (Ask). Capture the target now, before
@@ -548,27 +556,8 @@ pub fn wire(
         });
     }
 
-    // ---------- Stop (rewind to first frame + pause) ----------
-    {
-        let pipeline = pipeline.clone();
-        let play_btn = ui.play_btn.clone();
-        let user_paused = state.user_paused.clone();
-        let osd = ui.osd.clone();
-        ui.stop_btn.connect_clicked(move |_| {
-            user_paused.set(true);
-            // Pause first, then flush-seek to the start so the head frame is
-            // shown rather than continuing to play from zero.
-            pipeline.set_state(gst::State::Paused).ok();
-            pipeline
-                .seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                    gst::ClockTime::ZERO,
-                )
-                .ok();
-            play_btn.set_icon_name("media-playback-start-symbolic");
-            osd.show("media-playback-stop-symbolic", "Stopped");
-        });
-    }
+    // Stop returns to the home screen — wired in install_recents (it needs the
+    // recents refresh to show the just-stopped file).
 
     // ---------- Volume + click-to-mute ----------
     let last_volume = Rc::new(Cell::new(1.0_f64));
@@ -732,6 +721,9 @@ pub fn wire(
 
     // ---------- Resume banner + periodic history flush ----------
     install_resume(ui, pipe, state);
+
+    // ---------- Recently-played list on the home screen + Stop→home ----------
+    install_recents(ui, pipe, state, &load_file);
     // Apply the initial subtitle style to the label so it's styled from the
     // first cue (and reflects any persisted preferences).
     apply_subtitle_style(
@@ -2359,6 +2351,170 @@ fn run_action(
             }
         }
     }
+}
+
+// ===================== Recently-played list (home screen) ====================
+
+/// Display name for a recents entry: the stored title, else the file's
+/// basename, else the raw URI.
+fn recent_display_name(uri: &str, entry: &crate::resume::WatchEntry) -> String {
+    if !entry.title.is_empty() {
+        return entry.title.clone();
+    }
+    if uri.starts_with("file://") {
+        if let Some(name) = gio::File::for_uri(uri).basename() {
+            return name.to_string_lossy().into_owned();
+        }
+    }
+    uri.to_string()
+}
+
+/// Secondary line: a resume position if any, otherwise the source URL (streams)
+/// or nothing (finished local files).
+fn recent_subtitle(uri: &str, entry: &crate::resume::WatchEntry) -> String {
+    if entry.pos_ns > 0 && entry.dur_ns > 0 {
+        let pos = format_time(gst::ClockTime::from_nseconds(entry.pos_ns));
+        let dur = format_time(gst::ClockTime::from_nseconds(entry.dur_ns));
+        format!("Resume {pos} / {dur}")
+    } else if !uri.starts_with("file://") {
+        uri.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Build, wire, and populate the home-screen "recently played" list, and make
+/// the Stop button return to the home screen.
+fn install_recents(
+    ui: &UiHandles,
+    pipe: &PipelineHandles,
+    state: &AppState,
+    load_file: &Rc<dyn Fn(&gio::File)>,
+) {
+    let store = state.resume_store.clone();
+
+    // Self-referential refresh closure (rebuilt rows need to trigger a rebuild
+    // after a per-row remove).
+    let refresh: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let build: Rc<dyn Fn()> = {
+        let list = ui.recents_list.clone();
+        let section = ui.recents_section.clone();
+        let store = store.clone();
+        let load_file = load_file.clone();
+        let refresh_cell = refresh.clone();
+        Rc::new(move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let mut items = store.recents();
+            // Smart pruning: drop local files that have moved or been deleted.
+            items.retain(|(uri, _)| {
+                if uri.starts_with("file://") {
+                    let exists = gio::File::for_uri(uri)
+                        .path()
+                        .map(|p| p.exists())
+                        .unwrap_or(false);
+                    if !exists {
+                        store.forget(uri);
+                        return false;
+                    }
+                }
+                true
+            });
+            section.set_visible(!items.is_empty());
+
+            for (uri, entry) in items {
+                let title = gtk::Label::new(Some(&recent_display_name(&uri, &entry)));
+                title.add_css_class("recent-title");
+                title.set_xalign(0.0);
+                title.set_ellipsize(pango::EllipsizeMode::End);
+                let subtitle = gtk::Label::new(Some(&recent_subtitle(&uri, &entry)));
+                subtitle.add_css_class("recent-subtitle");
+                subtitle.set_xalign(0.0);
+                subtitle.set_ellipsize(pango::EllipsizeMode::End);
+                let text = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                text.set_hexpand(true);
+                text.append(&title);
+                if !subtitle.text().is_empty() {
+                    text.append(&subtitle);
+                }
+
+                let play = gtk::Button::new();
+                play.add_css_class("recent-play");
+                play.set_hexpand(true);
+                play.set_child(Some(&text));
+                {
+                    let load_file = load_file.clone();
+                    let uri = uri.clone();
+                    play.connect_clicked(move |_| load_file(&gio::File::for_uri(&uri)));
+                }
+
+                let remove = gtk::Button::from_icon_name("window-close-symbolic");
+                remove.add_css_class("recent-remove");
+                remove.set_valign(gtk::Align::Center);
+                remove.set_tooltip_text(Some("Remove"));
+                {
+                    let store = store.clone();
+                    let uri = uri.clone();
+                    let refresh_cell = refresh_cell.clone();
+                    remove.connect_clicked(move |_| {
+                        store.forget(&uri);
+                        if let Some(f) = refresh_cell.borrow().as_ref() {
+                            f();
+                        }
+                    });
+                }
+
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                row_box.append(&play);
+                row_box.append(&remove);
+                let row = gtk::ListBoxRow::new();
+                row.set_selectable(false);
+                row.set_activatable(false);
+                row.set_child(Some(&row_box));
+                list.append(&row);
+            }
+        })
+    };
+    *refresh.borrow_mut() = Some(build.clone());
+
+    // Clear all.
+    {
+        let store = store.clone();
+        let build = build.clone();
+        ui.recents_clear_btn.connect_clicked(move |_| {
+            store.clear();
+            build();
+        });
+    }
+
+    // Stop → flush position, tear down playback, and show the home screen with
+    // a freshly-refreshed recents list (including the file just stopped).
+    {
+        let pipeline = pipe.pipeline.clone();
+        let content_stack = ui.content_stack.clone();
+        let controls = ui.controls.clone();
+        let play_btn = ui.play_btn.clone();
+        let title_label = ui.title_label.clone();
+        let user_paused = state.user_paused.clone();
+        let window = ui.window.clone();
+        let store = store.clone();
+        let build = build.clone();
+        ui.stop_btn.connect_clicked(move |_| {
+            user_paused.set(true);
+            store.flush();
+            pipeline.set_state(gst::State::Null).ok();
+            content_stack.set_visible_child_name("empty");
+            controls.set_visible(false);
+            play_btn.set_icon_name("media-playback-start-symbolic");
+            title_label.set_text("");
+            window.set_title(Some("Soniq"));
+            build();
+        });
+    }
+
+    // Initial population (shown on the home screen at launch).
+    build();
 }
 
 // ===================== Resume (continue where you left off) ==================

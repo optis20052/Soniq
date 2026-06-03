@@ -56,10 +56,13 @@ const RESUME_FINISHED_PCT: u64 = 92;
 /// evicted past this count.
 const MAX_ENTRIES: usize = 500;
 
-/// One remembered file: where we stopped, how long it is, and when we last
-/// touched it (Unix seconds, for least-recently-used eviction).
-#[derive(Clone, Copy, Serialize, Deserialize)]
+/// One remembered file: a display title, where we stopped (0 = finished /
+/// nothing to resume), how long it is, and when we last touched it (Unix
+/// seconds, for recency sorting + least-recently-used eviction).
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct WatchEntry {
+    #[serde(default)]
+    pub title: String,
     pub pos_ns: u64,
     pub dur_ns: u64,
     #[serde(default)]
@@ -95,43 +98,70 @@ impl ResumeStore {
         }
     }
 
-    /// Record the current position for `uri`. Prunes the entry once the file is
-    /// effectively finished so it won't prompt next time.
+    /// Note that a file was just opened: ensure it's in the history with a
+    /// display title and a fresh recency, so it shows at the top of "recently
+    /// played" even before any position is recorded.
+    pub fn note_open(&self, uri: &str, title: &str) {
+        if uri.is_empty() {
+            return;
+        }
+        let mut map = self.map.borrow_mut();
+        let e = map.entry(uri.to_string()).or_default();
+        if !title.is_empty() {
+            e.title = title.to_string();
+        }
+        e.updated_at = now_secs();
+        enforce_cap(&mut map);
+        self.dirty.set(true);
+    }
+
+    /// Record the current position for `uri`. A finished file keeps its history
+    /// entry (so it still appears in "recently played") but its resume point is
+    /// cleared so we don't prompt to continue the closing minutes.
     pub fn record(&self, uri: &str, pos_ns: u64, dur_ns: u64) {
         if uri.is_empty() {
             return;
         }
         let mut map = self.map.borrow_mut();
-        if dur_ns > 0 && pos_ns.saturating_mul(100) >= dur_ns.saturating_mul(RESUME_FINISHED_PCT) {
-            if map.remove(uri).is_some() {
-                self.dirty.set(true);
-            }
-            return;
-        }
-        map.insert(
-            uri.to_string(),
-            WatchEntry { pos_ns, dur_ns, updated_at: now_secs() },
-        );
-        // Bound growth: drop the least-recently-updated entries past the cap.
-        while map.len() > MAX_ENTRIES {
-            let Some(oldest) = map.iter().min_by_key(|(_, e)| e.updated_at).map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            map.remove(&oldest);
-        }
+        let finished =
+            dur_ns > 0 && pos_ns.saturating_mul(100) >= dur_ns.saturating_mul(RESUME_FINISHED_PCT);
+        let e = map.entry(uri.to_string()).or_default();
+        e.pos_ns = if finished { 0 } else { pos_ns };
+        e.dur_ns = dur_ns;
+        e.updated_at = now_secs();
+        enforce_cap(&mut map);
         self.dirty.set(true);
     }
 
     /// The resume position for `uri`, if it's worth offering (enough watched).
     pub fn resumable(&self, uri: &str) -> Option<WatchEntry> {
-        let entry = *self.map.borrow().get(uri)?;
+        let entry = self.map.borrow().get(uri)?.clone();
         (entry.pos_ns >= RESUME_MIN_NS).then_some(entry)
     }
 
-    /// Forget a file (e.g. after the user chooses "start over").
+    /// All remembered files, most-recently-played first.
+    pub fn recents(&self) -> Vec<(String, WatchEntry)> {
+        let mut v: Vec<(String, WatchEntry)> = self
+            .map
+            .borrow()
+            .iter()
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        v.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+        v
+    }
+
+    /// Forget a single file (resume prompt + recents entry).
     pub fn forget(&self, uri: &str) {
         if self.map.borrow_mut().remove(uri).is_some() {
+            self.dirty.set(true);
+        }
+    }
+
+    /// Forget every remembered file.
+    pub fn clear(&self) {
+        if !self.map.borrow().is_empty() {
+            self.map.borrow_mut().clear();
             self.dirty.set(true);
         }
     }
@@ -151,6 +181,17 @@ impl ResumeStore {
         } else {
             let _ = std::fs::remove_file(&tmp); // don't leave a stray temp file
         }
+    }
+}
+
+/// Drop the least-recently-updated entries past the cap.
+fn enforce_cap(map: &mut HashMap<String, WatchEntry>) {
+    while map.len() > MAX_ENTRIES {
+        let Some(oldest) = map.iter().min_by_key(|(_, e)| e.updated_at).map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
     }
 }
 

@@ -55,6 +55,9 @@ pub struct UiHandles {
     // Empty state
     pub action_open: gtk::Button,
     pub action_url: gtk::Button,
+    pub recents_section: gtk::Box,
+    pub recents_list: gtk::ListBox,
+    pub recents_clear_btn: gtk::Button,
 
     // Buffering chip + debug overlay
     pub buffer_chip: gtk::Box,
@@ -349,17 +352,77 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
 
     let actions_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     actions_row.set_halign(gtk::Align::Center);
-    actions_row.set_margin_top(8);
+    actions_row.set_margin_top(18);
     actions_row.append(&action_open);
     actions_row.append(&action_url);
 
-    let empty_state = adw::StatusPage::builder()
-        .icon_name(crate::WORDMARK_ICON)
-        .title("Soniq")
-        .description("Drop a video here, open a file, or paste a URL")
-        .child(&actions_row)
+    // Left column: branding + actions.
+    let brand_logo = gtk::Image::from_icon_name(crate::WORDMARK_ICON);
+    brand_logo.set_pixel_size(112);
+    brand_logo.add_css_class("home-logo");
+
+    let brand_title = gtk::Label::new(Some("Soniq"));
+    brand_title.add_css_class("home-title");
+
+    let brand_desc = gtk::Label::new(Some("Drop a video here, open a file, or paste a URL"));
+    brand_desc.add_css_class("home-desc");
+    brand_desc.set_wrap(true);
+    brand_desc.set_justify(gtk::Justification::Center);
+    brand_desc.set_max_width_chars(28);
+
+    let brand_col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    brand_col.set_halign(gtk::Align::Center);
+    brand_col.set_valign(gtk::Align::Center);
+    brand_col.append(&brand_logo);
+    brand_col.append(&brand_title);
+    brand_col.append(&brand_desc);
+    brand_col.append(&actions_row);
+
+    // Right column: recently-played list (populated by handlers; hidden empty).
+    let recents_title = gtk::Label::new(Some("Recently played"));
+    recents_title.add_css_class("recents-title");
+    recents_title.set_hexpand(true);
+    recents_title.set_xalign(0.0);
+
+    let recents_clear_btn = gtk::Button::with_label("Clear");
+    recents_clear_btn.add_css_class("flat");
+    recents_clear_btn.set_valign(gtk::Align::Center);
+
+    let recents_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    recents_header.append(&recents_title);
+    recents_header.append(&recents_clear_btn);
+
+    let recents_list = gtk::ListBox::new();
+    recents_list.add_css_class("recents-list");
+    recents_list.set_selection_mode(gtk::SelectionMode::None);
+
+    let recents_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(360)
+        .propagate_natural_height(true)
+        .child(&recents_list)
         .build();
+    recents_scroll.add_css_class("recents-scroll");
+
+    let recents_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    recents_section.add_css_class("recents-section");
+    recents_section.set_valign(gtk::Align::Center);
+    recents_section.set_size_request(400, -1);
+    recents_section.append(&recents_header);
+    recents_section.append(&recents_scroll);
+    recents_section.set_visible(false);
+
+    // Two-column home: branding on the left, recents on the right. When there
+    // are no recents the right column is hidden and the branding centers alone.
+    let home_split = gtk::Box::new(gtk::Orientation::Horizontal, 56);
+    home_split.set_halign(gtk::Align::Center);
+    home_split.set_vexpand(true);
+    home_split.append(&brand_col);
+    home_split.append(&recents_section);
+
+    let empty_state = gtk::Box::new(gtk::Orientation::Vertical, 0);
     empty_state.add_css_class("empty-state");
+    empty_state.append(&home_split);
 
     let content_stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -558,6 +621,9 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         volume_box,
         action_open,
         action_url,
+        recents_section,
+        recents_list,
+        recents_clear_btn,
         buffer_chip,
         buffer_label,
         debug_label,
@@ -570,11 +636,11 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
 const CSS: &str = "
     .video-area { background-color: #000; }
 
-    .empty-state { background-color: #0a0a0c; }
+    .empty-state { background-color: #0a0a0c; padding: 24px 28px; }
     .empty-state > * { color: rgba(255, 255, 255, 0.92); }
-    .empty-state .icon { color: rgba(255, 255, 255, 0.70); -gtk-icon-size: 96px; }
-    .empty-state .title { color: rgba(255, 255, 255, 0.95); font-weight: 700; }
-    .empty-state .description { color: rgba(255, 255, 255, 0.60); }
+    .home-logo { color: rgba(255, 255, 255, 0.82); }
+    .home-title { color: rgba(255, 255, 255, 0.95); font-weight: 800; font-size: 2.0em; }
+    .home-desc { color: rgba(255, 255, 255, 0.55); }
     .empty-state button.pill {
         min-height: 36px;
         padding: 0 22px;
@@ -589,6 +655,40 @@ const CSS: &str = "
         background-color: #3584e4; border-color: transparent; color: white;
     }
     .empty-state button.pill.suggested-action:hover { background-color: #4593f0; }
+
+    /* Recently-played list on the home screen. */
+    .recents-title { color: rgba(255, 255, 255, 0.55); font-weight: 600; font-size: 0.9em; }
+    .recents-scroll {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        background-color: rgba(255, 255, 255, 0.03);
+        padding: 4px;
+    }
+    .recents-list { background-color: transparent; }
+    /* The whole row highlights as one rounded item on hover (no inner box). */
+    .recents-list > row {
+        border-radius: 9px;
+        margin-bottom: 2px;
+        transition: background-color 120ms ease;
+    }
+    .recents-list > row:hover { background-color: rgba(255, 255, 255, 0.08); }
+    .recent-play {
+        background: transparent; background-image: none;
+        box-shadow: none; border: none; border-radius: 9px;
+        padding: 9px 6px 9px 12px;
+    }
+    .recent-play:hover { background: transparent; }
+    .recent-title { color: rgba(255, 255, 255, 0.92); font-weight: 500; }
+    .recent-subtitle { color: rgba(255, 255, 255, 0.45); font-size: 0.82em; }
+    .recent-remove {
+        background: transparent; background-image: none;
+        box-shadow: none; border: none; color: rgba(255, 255, 255, 0.4);
+        min-width: 30px; min-height: 30px; margin: 0 6px; padding: 2px;
+        border-radius: 999px;
+    }
+    .recent-remove:hover {
+        background-color: rgba(232, 67, 62, 0.85); color: #fff;
+    }
 
     .player-top-bar {
         padding: 8px 10px;
