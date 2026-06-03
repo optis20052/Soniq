@@ -447,6 +447,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     debug_label.set_xalign(1.0);
     debug_label.set_wrap(false);
     debug_label.set_visible(false);
+    debug_label.set_can_target(false);
 
     let buffer_spinner = gtk::Spinner::new();
     buffer_spinner.set_size_request(22, 22);
@@ -463,6 +464,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         .visible(false)
         .build();
     buffer_chip.add_css_class("buffer-chip");
+    buffer_chip.set_can_target(false);
     buffer_chip.append(&buffer_spinner);
     buffer_chip.append(&buffer_label);
 
@@ -484,6 +486,9 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     subtitle_label.set_margin_start(40);
     subtitle_label.set_margin_end(40);
     subtitle_label.set_visible(false);
+    // Purely visual overlay — never intercept clicks, so double-click (and
+    // other gestures) on the video underneath still work over the subtitles.
+    subtitle_label.set_can_target(false);
 
     // ---- OSD notifications (top-center fading pill) ----
     let (osd, osd_widget) = crate::osd::Osd::new();
@@ -808,7 +813,7 @@ const CSS: &str = "
     .controls-bar scale { min-height: 16px; padding: 0; }
     .controls-bar scale trough {
         min-height: 4px;
-        background-color: rgba(255, 255, 255, 0.20);
+        background-color: rgba(255, 255, 255, 0.14);
         border: none; border-radius: 999px;
     }
     .controls-bar scale highlight {
@@ -822,8 +827,10 @@ const CSS: &str = "
         transition: transform 100ms ease;
     }
     .controls-bar scale:hover slider { transform: scale(1.15); }
+    /* Buffered-ahead range (stream download). Clearly lighter than the empty
+       trough so it reads as a distinct buffer band. */
     .controls-bar scale trough fill {
-        background-color: rgba(255, 255, 255, 0.40);
+        background-color: rgba(255, 255, 255, 0.42);
         background-image: none; border: none;
         border-radius: 999px; min-height: 4px;
     }

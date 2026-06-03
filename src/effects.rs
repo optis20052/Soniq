@@ -98,6 +98,10 @@ pub struct Effects {
     pub videocrop: Arc<Mutex<Option<gst::Element>>>,
     pub aspectratiocrop: Arc<Mutex<Option<gst::Element>>>,
     pub equalizer: Arc<Mutex<Option<gst::Element>>>,
+    /// Whether the (CPU) video-filter bin is currently attached to the playbin.
+    /// It's installed lazily — only when a video effect is actually used — so
+    /// default playback stays on the fast GPU path (no per-frame round-trips).
+    pub video_filter_on: Rc<Cell<bool>>,
 
     // Per-video parameters (reset on each new file).
     pub speed: Rc<Cell<f64>>,
@@ -116,6 +120,7 @@ impl Effects {
             videocrop: Arc::new(Mutex::new(None)),
             aspectratiocrop: Arc::new(Mutex::new(None)),
             equalizer: Arc::new(Mutex::new(None)),
+            video_filter_on: Rc::new(Cell::new(false)),
             speed: Rc::new(Cell::new(1.0)),
             av_offset_ns: Rc::new(Cell::new(0)),
             aspect: Rc::new(Cell::new(AspectMode::Default)),
@@ -156,6 +161,36 @@ impl Effects {
         *self.videoflip.lock().unwrap() = Some(videoflip);
 
         Some(bin.upcast())
+    }
+
+    /// Attach the video-filter bin to the playbin if it isn't already. Returns
+    /// true if it was just attached (the caller must Ready-cycle the pipeline
+    /// for playbin to pick it up). Building it lazily keeps default playback on
+    /// the fast GPU path.
+    pub fn ensure_video_filter(&self, pipeline: &gst::Element) -> bool {
+        if self.video_filter_on.get() {
+            return false;
+        }
+        if let Some(bin) = self.build_video_filter() {
+            pipeline.set_property("video-filter", &bin);
+            self.video_filter_on.set(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Detach the video-filter bin and drop the element refs, returning playback
+    /// to the fast no-filter path. Call while the pipeline is in NULL (e.g. at
+    /// the start of loading a new file) so the next preroll has no filter.
+    pub fn detach_video_filter(&self, pipeline: &gst::Element) {
+        pipeline.set_property("video-filter", None::<gst::Element>);
+        self.video_filter_on.set(false);
+        *self.videobalance.lock().unwrap() = None;
+        *self.gamma.lock().unwrap() = None;
+        *self.videocrop.lock().unwrap() = None;
+        *self.aspectratiocrop.lock().unwrap() = None;
+        *self.videoflip.lock().unwrap() = None;
     }
 
     /// Build the `equalizer-10bands` audio-filter element (also stashed).

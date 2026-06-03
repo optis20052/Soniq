@@ -79,6 +79,9 @@ pub fn wire(
             *queue_ref.lock().unwrap() = None;
             *source_ref.lock().unwrap() = None;
             pipeline.set_state(gst::State::Null).ok();
+            // Drop any lazily-attached video filter so the new file prerolls on
+            // the fast GPU path (it re-attaches if a video effect is used).
+            effects_load.detach_video_filter(&pipeline);
             // Set playbin3 flags based on source type. For local files the
             // +buffering flag (and the queue2 it inserts) is dead weight that
             // can wedge on heavy seeking. For network streams we add +download
@@ -2707,6 +2710,21 @@ fn qs_reload_pipeline(pipeline: &gst::Element, state: &AppState) {
     });
 }
 
+/// Apply a video effect, lazily attaching the video-filter bin on first use
+/// (which needs a one-time Ready-cycle for playbin to pick it up). Subsequent
+/// effect changes apply live with no reload.
+fn apply_video_effect(
+    state: &AppState,
+    pipeline: &gst::Element,
+    f: impl FnOnce(&crate::effects::Effects),
+) {
+    let newly = state.effects.ensure_video_filter(pipeline);
+    f(&state.effects);
+    if newly {
+        qs_reload_pipeline(pipeline, state);
+    }
+}
+
 /// Raise/lower the rank of common hardware decoder factories so playbin's
 /// autoplug prefers software decoders when HW decoding is switched off.
 fn set_hw_decoders_enabled(on: bool) {
@@ -2809,9 +2827,11 @@ fn build_video_qs_page(pipeline: &gst::Element, state: &AppState) -> adw::Prefer
         AspectMode::ALL.iter().position(|m| *m == effects.aspect.get()).unwrap_or(0) as u32,
     );
     {
-        let effects = effects.clone();
+        let state = state.clone();
+        let pipeline = pipeline.clone();
         aspect_row.connect_selected_notify(move |row| {
-            effects.set_aspect(AspectMode::ALL[row.selected() as usize]);
+            let m = AspectMode::ALL[row.selected() as usize];
+            apply_video_effect(&state, &pipeline, move |e| e.set_aspect(m));
         });
     }
     geo.add(&aspect_row);
@@ -2828,11 +2848,15 @@ fn build_video_qs_page(pipeline: &gst::Element, state: &AppState) -> adw::Prefer
         AspectMode::ALL.iter().position(|m| *m == effects.crop_mode.get()).unwrap_or(0) as u32,
     );
     {
-        let effects = effects.clone();
+        let state = state.clone();
         let pipeline = pipeline.clone();
         crop_row.connect_selected_notify(move |row| {
-            let (w, h) = source_video_size(&pipeline);
-            effects.set_crop(AspectMode::ALL[row.selected() as usize], w, h);
+            let m = AspectMode::ALL[row.selected() as usize];
+            let pipeline2 = pipeline.clone();
+            apply_video_effect(&state, &pipeline, move |e| {
+                let (w, h) = source_video_size(&pipeline2);
+                e.set_crop(m, w, h);
+            });
         });
     }
     geo.add(&crop_row);
@@ -2849,9 +2873,11 @@ fn build_video_qs_page(pipeline: &gst::Element, state: &AppState) -> adw::Prefer
         _ => 0,
     });
     {
-        let effects = effects.clone();
+        let state = state.clone();
+        let pipeline = pipeline.clone();
         rot_row.connect_selected_notify(move |row| {
-            effects.set_rotation([0u16, 90, 180, 270][row.selected() as usize]);
+            let deg = [0u16, 90, 180, 270][row.selected() as usize];
+            apply_video_effect(&state, &pipeline, move |e| e.set_rotation(deg));
         });
     }
     geo.add(&rot_row);
@@ -2924,26 +2950,25 @@ fn build_video_qs_page(pipeline: &gst::Element, state: &AppState) -> adw::Prefer
         row.add_suffix(&qs_reset(&scale, default));
         group.add(&row);
     };
-    add_color(&color, "Brightness", -1.0, 1.0, seed(&effects.videobalance, "brightness", 0.0), 0.0, {
-        let e = effects.clone();
-        Box::new(move |v| e.set_brightness(v))
-    });
-    add_color(&color, "Contrast", 0.0, 2.0, seed(&effects.videobalance, "contrast", 1.0), 1.0, {
-        let e = effects.clone();
-        Box::new(move |v| e.set_contrast(v))
-    });
-    add_color(&color, "Saturation", 0.0, 2.0, seed(&effects.videobalance, "saturation", 1.0), 1.0, {
-        let e = effects.clone();
-        Box::new(move |v| e.set_saturation(v))
-    });
-    add_color(&color, "Gamma", 0.1, 4.0, seed(&effects.gamma, "gamma", 1.0), 1.0, {
-        let e = effects.clone();
-        Box::new(move |v| e.set_gamma(v))
-    });
-    add_color(&color, "Hue", -1.0, 1.0, seed(&effects.videobalance, "hue", 0.0), 0.0, {
-        let e = effects.clone();
-        Box::new(move |v| e.set_hue(v))
-    });
+    // Each color slider routes through apply_video_effect so the video filter
+    // is lazily attached on first use.
+    let color_apply = |setter: fn(&crate::effects::Effects, f64)| -> Box<dyn Fn(f64)> {
+        let state = state.clone();
+        let pipeline = pipeline.clone();
+        Box::new(move |v| {
+            apply_video_effect(&state, &pipeline, move |e| setter(e, v));
+        })
+    };
+    add_color(&color, "Brightness", -1.0, 1.0, seed(&effects.videobalance, "brightness", 0.0), 0.0,
+        color_apply(|e, v| e.set_brightness(v)));
+    add_color(&color, "Contrast", 0.0, 2.0, seed(&effects.videobalance, "contrast", 1.0), 1.0,
+        color_apply(|e, v| e.set_contrast(v)));
+    add_color(&color, "Saturation", 0.0, 2.0, seed(&effects.videobalance, "saturation", 1.0), 1.0,
+        color_apply(|e, v| e.set_saturation(v)));
+    add_color(&color, "Gamma", 0.1, 4.0, seed(&effects.gamma, "gamma", 1.0), 1.0,
+        color_apply(|e, v| e.set_gamma(v)));
+    add_color(&color, "Hue", -1.0, 1.0, seed(&effects.videobalance, "hue", 0.0), 0.0,
+        color_apply(|e, v| e.set_hue(v)));
     page.add(&color);
 
     page

@@ -36,12 +36,11 @@ pub fn build_pipeline(state: &AppState) -> PipelineHandles {
     let paintable: gdk::Paintable = sink.property("paintable");
     pipeline.set_property("video-sink", &sink);
 
-    // Live video/audio effect filters for the quick-settings panel. Installed
-    // once here (they survive load_file, which never rebuilds the playbin); the
-    // quick-settings handlers tweak their child elements' properties live.
-    if let Some(vfilter) = state.effects.build_video_filter() {
-        pipeline.set_property("video-filter", &vfilter);
-    }
+    // Audio effect filter (equalizer-10bands) — cheap, installed up front. The
+    // VIDEO filter is NOT installed here: it's a CPU chain that forces a
+    // GPU->system-memory round-trip per frame (stuttery after seeks), so it's
+    // attached lazily only when a video effect is actually used (see Effects::
+    // ensure_video_filter) and detached again on each new file.
     if let Some(afilter) = state.effects.build_audio_filter() {
         pipeline.set_property("audio-filter", &afilter);
     }
