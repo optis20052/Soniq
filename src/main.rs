@@ -36,72 +36,112 @@ fn main() -> glib::ExitCode {
     // watchdog (non-flushing pause/resume → Ready-cycle recovery) in
     // handlers.rs rather than by avoiding the decoder.
 
-    // HANDLES_OPEN so file-manager "Open With Soniq" and `soniq file.mp4`
-    // deliver the file(s) to us via the `open` signal.
+    // Soniq is a single-instance app (HANDLES_OPEN lets file-manager "Open
+    // With Soniq" and `soniq file.mp4` deliver files via the `open` signal),
+    // but it supports many windows inside that one process — like Files or a
+    // browser. The two GApplication signals split cleanly:
     //
-    // NON_UNIQUE drops GApplication's default single-instance behaviour: every
-    // launch becomes its own process with its own window and playback pipeline,
-    // so the user can run several copies of Soniq side by side. Without it a
-    // second launch would just be forwarded to the first process.
+    //   * `activate` — fired on first launch, and again whenever the user asks
+    //     for a fresh instance (shift/middle-click the dock icon, the dock's
+    //     "New Window" action, or running `soniq` while it is already up). Each
+    //     time we open a brand-new window. A plain click on a running icon just
+    //     raises the existing window and never reaches here.
+    //   * `open` — a file double-click / `soniq file.mp4`. We load it into the
+    //     active (or most-recent) window so opening files reuses the window,
+    //     creating one only when none exists yet.
+    //
+    // GtkApplication keeps the process alive while any window is open and quits
+    // once the last one closes, so the window registry is all the bookkeeping
+    // multi-window needs.
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::NON_UNIQUE)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
-    // The window + its load_file closure are built lazily on the first
-    // activate/open and reused afterward (single-instance app).
-    let player: Rc<RefCell<Option<Player>>> = Rc::new(RefCell::new(None));
+    // Display-global setup that must run exactly once, before any window.
+    app.connect_startup(|_| {
+        ui::install_css();
+        install_branding();
+    });
+
+    // Live windows, so `open` can target the right one and we can drop a window
+    // when it closes. Shared by reference into the signal handlers.
+    let windows: Rc<RefCell<Vec<Player>>> = Rc::new(RefCell::new(Vec::new()));
 
     {
-        let player = player.clone();
+        let windows = windows.clone();
         app.connect_activate(move |app| {
-            ensure_player(app, &player); // just show the window (no file)
+            new_window(app, &windows);
         });
     }
     {
-        let player = player.clone();
+        let windows = windows.clone();
         app.connect_open(move |app, files, _hint| {
-            let p = ensure_player(app, &player);
-            if let Some(file) = files.first() {
-                (p.load_file)(file);
+            let player = active_player(app, &windows)
+                .unwrap_or_else(|| new_window(app, &windows));
+            for file in files {
+                (player.load_file)(file);
             }
+            player.window.present();
         });
     }
     app.run()
 }
 
-/// The built UI: the window plus the closure to load a file into it.
+/// A single player window plus the closure that loads a file into it.
+#[derive(Clone)]
 struct Player {
     window: adw::ApplicationWindow,
     load_file: Rc<dyn Fn(&gio::File)>,
 }
 
-/// Build the player UI once (storing it in `slot`) and present the window.
-/// Returns a lightweight handle (clones of the window + load_file).
-fn ensure_player(app: &adw::Application, slot: &Rc<RefCell<Option<Player>>>) -> Player {
-    if slot.borrow().is_none() {
-        ui::install_css();
-        install_branding();
+/// Build a fresh, fully independent player window (its own state, pipeline and
+/// handlers), register it, present it, and return a handle to it.
+fn new_window(app: &adw::Application, windows: &Rc<RefCell<Vec<Player>>>) -> Player {
+    let state = AppState::new();
+    config::apply_to_state(&config::load(), &state);
 
-        let state = AppState::new();
-        config::apply_to_state(&config::load(), &state);
+    let pipe = pipeline::build_pipeline(&state);
+    let ui = ui::build_ui(app, &pipe.paintable);
+    let load_file = handlers::wire(&ui, &pipe, &state);
 
-        let pipe = pipeline::build_pipeline(&state);
-        let ui = ui::build_ui(app, &pipe.paintable);
-        let load_file = handlers::wire(&ui, &pipe, &state);
+    let player = Player {
+        window: ui.window.clone(),
+        load_file,
+    };
+    windows.borrow_mut().push(player.clone());
 
-        *slot.borrow_mut() = Some(Player {
-            window: ui.window.clone(),
-            load_file,
+    // Drop the window from the registry once it closes so it can be freed (and
+    // so `open` never targets a dead window). GtkApplication quits the process
+    // when its last window goes away.
+    {
+        let windows = windows.clone();
+        let window_weak = ui.window.downgrade();
+        ui.window.connect_close_request(move |_| {
+            if let Some(closing) = window_weak.upgrade() {
+                windows.borrow_mut().retain(|p| p.window != closing);
+            }
+            glib::Propagation::Proceed
         });
     }
-    let player = slot.borrow();
-    let player = player.as_ref().unwrap();
+
     player.window.present();
-    Player {
-        window: player.window.clone(),
-        load_file: player.load_file.clone(),
+    player
+}
+
+/// The player whose window is currently focused, falling back to the most
+/// recently opened one. `None` only when no window is open at all.
+fn active_player(app: &adw::Application, windows: &Rc<RefCell<Vec<Player>>>) -> Option<Player> {
+    let windows = windows.borrow();
+    if let Some(active) = app.active_window() {
+        if let Some(p) = windows
+            .iter()
+            .find(|p| p.window.upcast_ref::<gtk::Window>() == &active)
+        {
+            return Some(p.clone());
+        }
     }
+    windows.last().cloned()
 }
 
 /// Register the embedded logo as the app icon so the window, taskbar, and the
