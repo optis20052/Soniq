@@ -524,13 +524,14 @@ const CSS: &str = "
     .controls-bar button:active { background-color: rgba(255, 255, 255, 0.22); }
     /* Prominent filled play/pause button — the hero control. */
     .controls-bar button.play-btn {
-        background-color: rgba(255, 255, 255, 0.96);
+        background-color: rgba(255, 255, 255, 0.82);
         color: #111;
         min-width: 46px; min-height: 46px;
         padding: 0;
+        transition: background-color 140ms ease;
     }
     .controls-bar button.play-btn:hover { background-color: #ffffff; color: #000; }
-    .controls-bar button.play-btn:active { background-color: rgba(255, 255, 255, 0.85); }
+    .controls-bar button.play-btn:active { background-color: rgba(255, 255, 255, 0.70); }
     .controls-bar button.play-btn image { -gtk-icon-size: 22px; }
 
     .controls-bar scale { min-height: 16px; padding: 0; }
