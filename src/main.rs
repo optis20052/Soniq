@@ -42,7 +42,7 @@ fn main() -> glib::ExitCode {
         .build();
 
     // The window + its load_file closure are built lazily on the first
-    // activate/open and reused afterwards (single-instance app).
+    // activate/open and reused afterward (single-instance app).
     let player: Rc<RefCell<Option<Player>>> = Rc::new(RefCell::new(None));
 
     {

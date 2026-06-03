@@ -1153,11 +1153,16 @@ fn install_overlay_chrome(ui: &UiHandles) {
         // in GTK4 (allocation()/compute_bounds() can report 0 here) and were
         // making the bar jump to the top on the first move.
         let base = Rc::new(Cell::new(None::<(f64, f64)>));
+        // Whether this press has crossed the drag threshold (so we know it's a
+        // drag, not a click). Reset at each press.
+        let moved = Rc::new(Cell::new(false));
         let controls = ui.controls.clone();
         {
             let base = base.clone();
+            let moved = moved.clone();
             let controls = controls.clone();
             drag.connect_drag_begin(move |g, x, y| {
+                moved.set(false);
                 let Some(parent) = controls.parent() else {
                     base.set(None);
                     g.set_state(gtk::EventSequenceState::Denied);
@@ -1191,9 +1196,20 @@ fn install_overlay_chrome(ui: &UiHandles) {
         }
         {
             let base = base.clone();
+            let moved = moved.clone();
             let controls = controls.clone();
-            drag.connect_drag_update(move |_g, off_x, off_y| {
+            drag.connect_drag_update(move |g, off_x, off_y| {
                 let Some((bx, by)) = base.get() else { return };
+                // Ignore tiny travel so a press-and-release stays a click. Once
+                // past the threshold this is a drag: claim the gesture so the
+                // button under the pointer doesn't also fire its action.
+                if !moved.get() {
+                    if off_x.hypot(off_y) < theme::BAR_DRAG_THRESHOLD {
+                        return;
+                    }
+                    moved.set(true);
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                }
                 let mut nx = (bx + off_x) as i32;
                 let mut ny = (by + off_y) as i32;
                 // Switch to absolute positioning on first move.

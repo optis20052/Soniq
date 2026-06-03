@@ -17,6 +17,11 @@
 /// default bottom rest position and the drag clamp on all four sides.
 pub const BAR_EDGE_INSET: i32 = 8;
 
+/// Pointer travel (px) before a press on the bar counts as a drag rather than a
+/// click. Below this the bar doesn't move and the click reaches the button;
+/// past it the drag claims the gesture so the button's action doesn't fire.
+pub const BAR_DRAG_THRESHOLD: f64 = 6.0;
+
 /// Fixed (non-seek) width of the seek row: the time labels, their spacing and
 /// the bar's horizontal padding. Used to size the responsive seek scale.
 pub const SEEK_ROW_CHROME: i32 = 150;
