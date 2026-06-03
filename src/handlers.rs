@@ -2027,44 +2027,48 @@ fn install_mouse_clicks(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState
     });
     ui.picture.add_controller(gesture);
 
-    // Drag anywhere on the video to move the window. We hand off to the
-    // compositor (Toplevel::begin_move) once the pointer passes a small
-    // threshold, so plain clicks still toggle play/pause. The controls panel is
-    // a separate overlay child and intercepts its own events, so it's excluded.
+    // Drag anywhere on the video — or the home screen — to move the window.
+    // Clicks still pass through (begin_move only fires past a small threshold).
+    attach_window_move_drag(&ui.picture, &ui.window);
+    attach_window_move_drag(&ui.empty_state, &ui.window);
+}
+
+/// Make `widget` a window-drag region: dragging it past a small threshold hands
+/// off to the compositor (`Toplevel::begin_move`), while plain clicks still
+/// reach child widgets. Used for the video and the home screen so the window
+/// can be moved from anywhere, not just the title bar.
+fn attach_window_move_drag(widget: &impl IsA<gtk::Widget>, window: &adw::ApplicationWindow) {
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(gdk::BUTTON_PRIMARY);
+    let moving = Rc::new(Cell::new(false));
     {
-        let window = ui.window.clone();
-        let move_drag = gtk::GestureDrag::new();
-        move_drag.set_button(gdk::BUTTON_PRIMARY);
-        let moving = Rc::new(Cell::new(false));
-        {
-            let moving = moving.clone();
-            move_drag.connect_drag_begin(move |_, _, _| moving.set(false));
-        }
-        {
-            let moving = moving.clone();
-            let window = window.clone();
-            move_drag.connect_drag_update(move |g, off_x, off_y| {
-                if moving.get() || off_x.hypot(off_y) < 8.0 {
-                    return;
-                }
-                moving.set(true);
-                let Some(surface) = window.surface() else { return };
-                let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() else {
-                    return;
-                };
-                let Some(device) = g.current_event_device() else { return };
-                let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
-                toplevel.begin_move(
-                    &device,
-                    g.current_button() as i32,
-                    sx,
-                    sy,
-                    g.current_event_time(),
-                );
-            });
-        }
-        ui.picture.add_controller(move_drag);
+        let moving = moving.clone();
+        drag.connect_drag_begin(move |_, _, _| moving.set(false));
     }
+    {
+        let moving = moving.clone();
+        let window = window.clone();
+        drag.connect_drag_update(move |g, off_x, off_y| {
+            if moving.get() || off_x.hypot(off_y) < 8.0 {
+                return;
+            }
+            moving.set(true);
+            let Some(surface) = window.surface() else { return };
+            let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() else {
+                return;
+            };
+            let Some(device) = g.current_event_device() else { return };
+            let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
+            toplevel.begin_move(
+                &device,
+                g.current_button() as i32,
+                sx,
+                sy,
+                g.current_event_time(),
+            );
+        });
+    }
+    widget.add_controller(drag);
 }
 
 /// Right-click anywhere on the player surface opens a small menu with

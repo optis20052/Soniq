@@ -53,6 +53,7 @@ pub struct UiHandles {
     pub volume_box: gtk::Box,
 
     // Empty state
+    pub empty_state: gtk::Box,
     pub action_open: gtk::Button,
     pub action_url: gtk::Button,
     pub recents_section: gtk::Box,
@@ -619,6 +620,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         volume_scale,
         volume_revealer,
         volume_box,
+        empty_state,
         action_open,
         action_url,
         recents_section,
