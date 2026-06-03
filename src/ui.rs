@@ -1,6 +1,8 @@
 use adw::prelude::*;
 use gtk::{gdk, pango};
 
+use crate::theme;
+
 /// All the widgets that event handlers need to reference, in one bag.
 pub struct UiHandles {
     pub window: adw::ApplicationWindow,
@@ -220,7 +222,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
 
     let volume_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.02);
     volume_scale.set_value(1.0);
-    volume_scale.set_size_request(96, -1);
+    volume_scale.set_size_request(theme::VOLUME_SLIDER_WIDTH, -1);
     volume_scale.set_draw_value(false);
     volume_scale.set_hexpand(false);
 
@@ -315,13 +317,13 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     // It hugs its content and sits centered near the bottom, so its side margins
     // are always symmetric. The seek scale's width is capped responsively in
     // handlers.rs so the whole bar always fits the window with breathing room.
-    seek_scale.set_width_request(440);
+    seek_scale.set_width_request(theme::SEEK_WIDTH_DEFAULT);
     let controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::End)
-        .margin_bottom(8)
+        .margin_bottom(theme::BAR_EDGE_INSET)
         .build();
     controls.add_css_class("controls-bar");
     // Buttons on top, seek bar pinned to the bottom of the panel.
@@ -405,7 +407,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     subtitle_label.set_valign(gtk::Align::End);
     subtitle_label.set_justify(gtk::Justification::Center);
     subtitle_label.set_wrap(true);
-    subtitle_label.set_margin_bottom(40); // small default gap from the bottom
+    subtitle_label.set_margin_bottom(theme::SUBTITLE_MARGIN_DEFAULT); // small default gap
     subtitle_label.set_margin_start(40);
     subtitle_label.set_margin_end(40);
     subtitle_label.set_visible(false);
@@ -442,13 +444,13 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
 
     let settings_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     settings_panel.add_css_class("quick-settings-panel");
-    settings_panel.set_size_request(360, -1);
+    settings_panel.set_size_request(theme::PANEL_WIDTH, -1);
     settings_panel.append(&settings_header);
     settings_panel.append(&settings_scroll);
 
     let settings_revealer = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideLeft)
-        .transition_duration(250)
+        .transition_duration(theme::PANEL_TRANSITION_MS)
         .reveal_child(false)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Fill)

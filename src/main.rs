@@ -6,6 +6,7 @@ mod pipeline;
 mod shortcuts;
 mod state;
 mod subtitles;
+mod theme;
 mod ui;
 mod util;
 

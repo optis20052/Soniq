@@ -79,10 +79,12 @@ pub fn apply_to_state(cfg: &Config, state: &AppState) {
         *state.subtitles.style.lock().unwrap() = style.clone();
     }
     if let Some(s) = cfg.subtitle_scale {
-        state.subtitle_scale.set(s.clamp(0.5, 3.0));
+        state.subtitle_scale.set(
+            s.clamp(crate::theme::SUBTITLE_SCALE_MIN, crate::theme::SUBTITLE_SCALE_MAX),
+        );
     }
     if let Some(m) = cfg.subtitle_margin {
-        state.subtitle_margin.set(m.clamp(0, 300));
+        state.subtitle_margin.set(m.clamp(0, crate::theme::SUBTITLE_MARGIN_MAX));
     }
     if let Some(debug) = cfg.show_debug {
         state.show_debug.set(debug);

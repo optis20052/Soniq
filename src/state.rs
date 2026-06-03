@@ -114,8 +114,8 @@ impl AppState {
             volume: Rc::new(Cell::new(1.0)),
             effects: Effects::new(),
             subtitle_delay_ns: Rc::new(Cell::new(0)),
-            subtitle_scale: Rc::new(Cell::new(1.0)),
-            subtitle_margin: Rc::new(Cell::new(40)),
+            subtitle_scale: Rc::new(Cell::new(crate::theme::SUBTITLE_SCALE_DEFAULT)),
+            subtitle_margin: Rc::new(Cell::new(crate::theme::SUBTITLE_MARGIN_DEFAULT)),
             current_uri: Rc::new(RefCell::new(None)),
         }
     }

@@ -13,6 +13,7 @@ use crate::effects::{AspectMode, EQ_PRESETS};
 use crate::pipeline::PipelineHandles;
 use crate::shortcuts::Action;
 use crate::state::AppState;
+use crate::theme;
 use crate::ui::UiHandles;
 use crate::util::format_time;
 
@@ -776,8 +777,6 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
             })
             .map(|b| *b)
             .unwrap_or(0);
-        let still_more_to_download =
-            total_bytes_src > 0 && downloaded_bytes + 1024 * 1024 < total_bytes_src;
 
         let pos_ns = pos.map(|p| p.nseconds()).unwrap_or(0);
         // Grace after a seek: long enough for normal HW-decoder seek latency,
@@ -1134,7 +1133,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
             hide_token.set(token);
             let hide_chrome = hide_chrome.clone();
             let hide_token = hide_token.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(2500), move || {
+            glib::timeout_add_local(std::time::Duration::from_millis(theme::AUTOHIDE_MS), move || {
                 if hide_token.get() == token {
                     hide_chrome();
                 }
@@ -1170,7 +1169,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
     if let Some(overlay) = ui.controls.parent() {
         let drag = gtk::GestureDrag::new();
         // Default gap the centered bar keeps from the window bottom.
-        const DEFAULT_BOTTOM: i32 = 8;
+        const DEFAULT_BOTTOM: i32 = theme::BAR_EDGE_INSET;
         // base = the bar's top-left (overlay coords) at drag start. We position
         // purely by adding the gesture's *offset* (which is reliable) to this
         // base, so we never read a widget's absolute x/y — those are unreliable
@@ -1225,7 +1224,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
                 controls.set_valign(gtk::Align::Start);
                 controls.set_margin_bottom(0);
                 if let Some(parent) = controls.parent() {
-                    const INSET: i32 = 8; // keep a comfortable margin from the window edges
+                    const INSET: i32 = theme::BAR_EDGE_INSET;
                     let (bar_w, bar_h) = bar_size(&controls, &parent);
                     // Keep up to INSET margin per side, but shrink the margin
                     // (down to centered) when an axis has no slack, so a tight
@@ -1259,7 +1258,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
             let Some(parent) = controls.parent() else {
                 return ControlFlow::Continue;
             };
-            const INSET: i32 = 8;
+            const INSET: i32 = theme::BAR_EDGE_INSET;
 
             // Progressively collapse non-essential controls as the window
             // narrows so the panel never outgrows the window. Transport + seek
@@ -1290,7 +1289,7 @@ fn install_overlay_chrome(ui: &UiHandles) {
                     controls.set_valign(gtk::Align::End);
                     controls.set_margin_start(0);
                     controls.set_margin_top(0);
-                    controls.set_margin_bottom(8);
+                    controls.set_margin_bottom(theme::BAR_EDGE_INSET);
                 } else {
                     // Clamp within the window, keeping up to INSET margin on
                     // each side (less when space is tight), without ever
@@ -1314,12 +1313,12 @@ fn install_overlay_chrome(ui: &UiHandles) {
                 // margins are always symmetric); we cap the seek scale's width
                 // so the whole bar fits the window with a comfortable gutter
                 // on each side instead of running into the edges.
-                const SIDE_GUTTER: i32 = 8; // min gap from each window edge
+                const SIDE_GUTTER: i32 = theme::BAR_EDGE_INSET;
                 // Width of the seek row's fixed chrome (time labels + spacing +
                 // the bar's horizontal padding) — everything except the scale.
-                const SEEK_ROW_CHROME: i32 = 150;
+                const SEEK_ROW_CHROME: i32 = theme::SEEK_ROW_CHROME;
                 let avail = parent.width() - 2 * SIDE_GUTTER - SEEK_ROW_CHROME;
-                let target = avail.clamp(110, 460);
+                let target = avail.clamp(theme::SEEK_WIDTH_MIN, theme::SEEK_WIDTH_MAX);
                 if seek_scale.width_request() != target {
                     seek_scale.set_width_request(target);
                 }
@@ -1767,7 +1766,7 @@ fn build_subtitles_page(
 
     // --- Vertical offset (moves bottom-aligned subtitles up/down) ---
     let (offset_row, offset_scale) =
-        qs_slider("Vertical offset", 0.0, 300.0, 4.0, margin.get() as f64);
+        qs_slider("Vertical offset", 0.0, theme::SUBTITLE_MARGIN_MAX as f64, 4.0, margin.get() as f64);
     {
         let margin = margin.clone();
         let apply = apply.clone();
@@ -1776,7 +1775,7 @@ fn build_subtitles_page(
             apply();
         });
     }
-    offset_row.add_suffix(&qs_reset(&offset_scale, 40.0));
+    offset_row.add_suffix(&qs_reset(&offset_scale, theme::SUBTITLE_MARGIN_DEFAULT as f64));
     group.add(&offset_row);
 
     let page = adw::PreferencesPage::builder()
@@ -2840,7 +2839,7 @@ fn build_subtitle_qs_page(
     timing.add(&delay_row);
 
     let (pos_row, pos_scale) =
-        qs_slider("Position", 0.0, 300.0, 4.0, state.subtitle_margin.get() as f64);
+        qs_slider("Position", 0.0, theme::SUBTITLE_MARGIN_MAX as f64, 4.0, state.subtitle_margin.get() as f64);
     {
         let margin = state.subtitle_margin.clone();
         let apply = apply.clone();
@@ -2849,10 +2848,10 @@ fn build_subtitle_qs_page(
             apply();
         });
     }
-    pos_row.add_suffix(&qs_reset(&pos_scale, 40.0));
+    pos_row.add_suffix(&qs_reset(&pos_scale, theme::SUBTITLE_MARGIN_DEFAULT as f64));
     timing.add(&pos_row);
 
-    let (scale_row, scale_scale) = qs_slider("Scale", 0.5, 3.0, 0.05, state.subtitle_scale.get());
+    let (scale_row, scale_scale) = qs_slider("Scale", theme::SUBTITLE_SCALE_MIN, theme::SUBTITLE_SCALE_MAX, 0.05, state.subtitle_scale.get());
     scale_scale.set_draw_value(true);
     scale_scale.set_value_pos(gtk::PositionType::Left);
     {
@@ -2863,7 +2862,7 @@ fn build_subtitle_qs_page(
             apply();
         });
     }
-    scale_row.add_suffix(&qs_reset(&scale_scale, 1.0));
+    scale_row.add_suffix(&qs_reset(&scale_scale, theme::SUBTITLE_SCALE_DEFAULT));
     timing.add(&scale_row);
     page.add(&timing);
 
