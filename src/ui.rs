@@ -678,6 +678,7 @@ const CSS: &str = "
         padding: 9px 6px 9px 12px;
     }
     .recent-play:hover { background: transparent; }
+    .recent-icon { color: rgba(255, 255, 255, 0.55); -gtk-icon-size: 18px; }
     .recent-title { color: rgba(255, 255, 255, 0.92); font-weight: 500; }
     .recent-subtitle { color: rgba(255, 255, 255, 0.45); font-size: 0.82em; }
     .recent-remove {

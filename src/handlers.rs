@@ -2439,10 +2439,24 @@ fn install_recents(
                     text.append(&subtitle);
                 }
 
+                // A film icon for local files, a link icon for streams.
+                let icon_name = if uri.starts_with("file://") {
+                    "video-x-generic-symbolic"
+                } else {
+                    "insert-link-symbolic"
+                };
+                let icon = gtk::Image::from_icon_name(icon_name);
+                icon.add_css_class("recent-icon");
+                icon.set_valign(gtk::Align::Center);
+
+                let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                content.append(&icon);
+                content.append(&text);
+
                 let play = gtk::Button::new();
                 play.add_css_class("recent-play");
                 play.set_hexpand(true);
-                play.set_child(Some(&text));
+                play.set_child(Some(&content));
                 {
                     let load_file = load_file.clone();
                     let uri = uri.clone();
