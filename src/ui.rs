@@ -93,11 +93,25 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     left_btns.append(&open_btn);
     left_btns.append(&link_btn);
 
-    let drag_handle = gtk::WindowHandle::new();
-    let drag_filler = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    drag_filler.set_hexpand(true);
-    drag_handle.set_child(Some(&drag_filler));
-    drag_handle.set_hexpand(true);
+    // Two expanding drag handles flank the centered title so the filename sits
+    // dead-centre in the top bar (and both sides stay window-drag zones).
+    let make_drag_handle = || {
+        let h = gtk::WindowHandle::new();
+        let filler = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        filler.set_hexpand(true);
+        h.set_child(Some(&filler));
+        h.set_hexpand(true);
+        h
+    };
+    let drag_handle_l = make_drag_handle();
+    let drag_handle_r = make_drag_handle();
+
+    // Filename, shown centered at the top of the player (outside the control
+    // panel). Empty until a file loads.
+    let title_label = gtk::Label::new(Some(""));
+    title_label.add_css_class("player-title");
+    title_label.set_max_width_chars(48);
+    title_label.set_ellipsize(pango::EllipsizeMode::End);
 
     let settings_btn = gtk::Button::from_icon_name("emblem-system-symbolic");
     settings_btn.set_tooltip_text(Some("Preferences"));
@@ -137,7 +151,9 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
         .build();
     top_bar.add_css_class("player-top-bar");
     top_bar.append(&left_btns);
-    top_bar.append(&drag_handle);
+    top_bar.append(&drag_handle_l);
+    top_bar.append(&title_label);
+    top_bar.append(&drag_handle_r);
     top_bar.append(&right_btns);
 
     // ---- Bottom controls ----
@@ -148,7 +164,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
 
     let duration_label = gtk::Label::new(Some("0:00"));
     duration_label.add_css_class("time");
-    duration_label.set_width_chars(5);
+    duration_label.set_width_chars(6); // fits the leading "-" of remaining time
     duration_label.set_xalign(1.0);
 
     let seek_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
@@ -172,7 +188,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     prev_btn.set_focus_on_click(false);
 
     let play_btn = gtk::Button::from_icon_name("media-playback-start-symbolic");
-    play_btn.add_css_class("circular");
+    play_btn.add_css_class("osd-button");
     play_btn.add_css_class("play-btn");
     play_btn.set_tooltip_text(Some("Play/Pause (Space)"));
     play_btn.set_focus_on_click(false);
@@ -187,16 +203,6 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     next_btn.set_tooltip_text(Some("Next"));
     next_btn.set_focus_on_click(false);
 
-    let title_label = gtk::Label::new(Some(""));
-    title_label.add_css_class("title");
-    title_label.set_xalign(0.0);
-    title_label.set_hexpand(false);
-    // Fixed width (both bounds equal) so the bar's overall width stays constant
-    // regardless of the title text — keeps drag-edge clamping consistent.
-    title_label.set_width_chars(16);
-    title_label.set_max_width_chars(16);
-    title_label.set_ellipsize(pango::EllipsizeMode::End);
-
     let volume_btn = gtk::Button::from_icon_name("audio-volume-high-symbolic");
     volume_btn.add_css_class("osd-button");
     volume_btn.set_tooltip_text(Some("Volume (click to mute)"));
@@ -204,20 +210,22 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
 
     let volume_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.02);
     volume_scale.set_value(1.0);
-    volume_scale.set_size_request(110, -1);
+    volume_scale.set_size_request(96, -1);
     volume_scale.set_draw_value(false);
     volume_scale.set_hexpand(false);
 
+    // Volume slider is shown inline (IINA-style), always visible. The revealer
+    // is kept so existing handlers still reference it, but it stays open.
     let volume_revealer = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideLeft)
         .transition_duration(220)
-        .reveal_child(false)
+        .reveal_child(true)
         .child(&volume_scale)
         .build();
 
     let volume_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(2)
+        .spacing(4)
         .build();
     volume_box.add_css_class("volume-area");
     volume_box.append(&volume_btn);
@@ -233,36 +241,63 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     subtitle_btn.set_tooltip_text(Some("Subtitles"));
     subtitle_btn.set_focus_on_click(false);
 
-    let row_bot = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    row_bot.append(&prev_btn);
-    row_bot.append(&play_btn);
-    row_bot.append(&stop_btn);
-    row_bot.append(&next_btn);
-    row_bot.append(&title_label);
-    row_bot.append(&subtitle_btn);
-    row_bot.append(&volume_box);
-    row_bot.append(&fullscreen_btn);
-    // Keep the buttons clustered in the centre of the (stretchable) bar.
-    row_bot.set_halign(gtk::Align::Center);
+    // Keep every control vertically centred so its round hover stays a circle.
+    // (Otherwise the shorter buttons stretch to the play button's height and
+    // their pill-radius hover renders as an oval.)
+    for b in [
+        &prev_btn, &play_btn, &stop_btn, &next_btn, &subtitle_btn, &fullscreen_btn, &volume_btn,
+    ] {
+        b.set_valign(gtk::Align::Center);
+    }
+    volume_box.set_valign(gtk::Align::Center);
 
-    // Compact, centered, floating bar (IINA-style). It hugs its content and
-    // sits centered near the bottom, so its side margins are always symmetric.
-    // The seek scale's width is capped responsively in handlers.rs so the whole
-    // bar always fits the window with breathing room instead of overflowing.
-    seek_scale.set_width_request(340);
+    // Center transport cluster (prev / play / next) — the play button sits dead
+    // centre of the bar; stop moves to the right cluster.
+    let transport = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(14)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    transport.append(&prev_btn);
+    transport.append(&play_btn);
+    transport.append(&next_btn);
+
+    // Right utility cluster (stop / subtitles / fullscreen).
+    let right_cluster = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    right_cluster.append(&stop_btn);
+    right_cluster.append(&subtitle_btn);
+    right_cluster.append(&fullscreen_btn);
+
+    // IINA-style 3-zone row via CenterBox: volume far-left, transport ALWAYS
+    // dead-centre of the panel (independent of side widths), utilities far-right.
+    let row_bot = gtk::CenterBox::new();
+    row_bot.set_hexpand(true);
+    row_bot.set_start_widget(Some(&volume_box));
+    row_bot.set_center_widget(Some(&transport));
+    row_bot.set_end_widget(Some(&right_cluster));
+
+    // Centered, floating bar (IINA-style), wide enough to spread the controls.
+    // It hugs its content and sits centered near the bottom, so its side margins
+    // are always symmetric. The seek scale's width is capped responsively in
+    // handlers.rs so the whole bar always fits the window with breathing room.
+    seek_scale.set_width_request(440);
     let controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
+        .spacing(6)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::End)
         .margin_bottom(8)
         .build();
     controls.add_css_class("controls-bar");
-    controls.append(&row_top);
+    // Buttons on top, seek bar pinned to the bottom of the panel.
     controls.append(&row_bot);
+    controls.append(&row_top);
 
     // ---- Empty state ----
     let action_open = gtk::Button::with_label("Open File");
@@ -437,6 +472,14 @@ const CSS: &str = "
             rgba(0, 0, 0, 0.55) 0%, rgba(0, 0, 0, 0.0) 100%);
         min-height: 38px;
     }
+    /* Filename centered at the top of the player. */
+    .player-title {
+        color: rgba(255, 255, 255, 0.95);
+        font-weight: 600;
+        font-size: 0.95em;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+        padding: 0 8px;
+    }
     /* Close button gets a red hover tint, like every desktop. */
     .osd-button.close-button:hover { background-color: rgba(232, 67, 62, 0.85); }
 
@@ -451,63 +494,72 @@ const CSS: &str = "
     .osd-button:active { background-color: rgba(255, 255, 255, 0.22); }
 
     .controls-bar {
-        background-color: rgba(24, 24, 27, 0.86);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 14px;
-        padding: 6px 12px 8px 12px;
-        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+        background-color: rgba(30, 30, 34, 0.72);
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        border-radius: 18px;
+        padding: 10px 18px 12px 18px;
+        box-shadow: 0 10px 34px rgba(0, 0, 0, 0.50);
     }
     /* Faded state for auto-hide (transitions opacity). */
     .controls-bar, .player-top-bar { transition: opacity 220ms ease; }
     .autohide-hidden { opacity: 0; }
     .controls-bar label { color: rgba(255, 255, 255, 0.92); font-feature-settings: 'tnum'; }
     .controls-bar label.time {
-        color: rgba(255, 255, 255, 0.70); font-size: 0.85em; padding: 0 2px;
+        color: rgba(255, 255, 255, 0.62); font-size: 0.82em; padding: 0 2px;
     }
-    .controls-bar label.title {
-        color: rgba(255, 255, 255, 0.92); font-weight: 500; padding: 0 8px;
-    }
-    .controls-bar image { -gtk-icon-size: 16px; }
+    .controls-bar image { -gtk-icon-size: 18px; }
 
     .controls-bar button {
-        color: rgba(255, 255, 255, 0.92);
+        color: rgba(255, 255, 255, 0.88);
         background-color: transparent; background-image: none;
         box-shadow: none; border: none;
-        min-width: 30px; min-height: 30px;
-        padding: 4px; border-radius: 999px;
+        min-width: 34px; min-height: 34px;
+        padding: 5px; border-radius: 999px;
+        transition: background-color 120ms ease, color 120ms ease;
     }
-    .controls-bar button:hover { background-color: rgba(255, 255, 255, 0.15); }
+    .controls-bar button:hover {
+        background-color: rgba(255, 255, 255, 0.14);
+        color: #ffffff;
+    }
     .controls-bar button:active { background-color: rgba(255, 255, 255, 0.22); }
-    .controls-bar button.circular.play-btn {
-        background-color: rgba(255, 255, 255, 0.95); color: #111;
-        min-width: 32px; min-height: 32px;
+    /* Prominent filled play/pause button — the hero control. */
+    .controls-bar button.play-btn {
+        background-color: rgba(255, 255, 255, 0.96);
+        color: #111;
+        min-width: 46px; min-height: 46px;
+        padding: 0;
     }
-    .controls-bar button.circular.play-btn:hover { background-color: #ffffff; }
+    .controls-bar button.play-btn:hover { background-color: #ffffff; color: #000; }
+    .controls-bar button.play-btn:active { background-color: rgba(255, 255, 255, 0.85); }
+    .controls-bar button.play-btn image { -gtk-icon-size: 22px; }
 
-    .controls-bar scale { min-height: 18px; padding: 0; }
+    .controls-bar scale { min-height: 16px; padding: 0; }
     .controls-bar scale trough {
         min-height: 4px;
-        background-color: rgba(255, 255, 255, 0.22);
-        border: none; border-radius: 2px;
+        background-color: rgba(255, 255, 255, 0.20);
+        border: none; border-radius: 999px;
     }
     .controls-bar scale highlight {
-        background-color: #ffffff; border-radius: 2px;
+        background-color: rgba(255, 255, 255, 0.92); border-radius: 999px;
     }
     .controls-bar scale slider {
         background-color: #ffffff; background-image: none; border: none;
-        min-width: 14px; min-height: 14px; margin: -6px;
+        min-width: 13px; min-height: 13px; margin: -6px;
         border-radius: 50%;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+        transition: transform 100ms ease;
     }
+    .controls-bar scale:hover slider { transform: scale(1.15); }
     .controls-bar scale trough fill {
-        background-color: rgba(255, 255, 255, 0.45);
+        background-color: rgba(255, 255, 255, 0.40);
         background-image: none; border: none;
-        border-radius: 2px; min-height: 4px;
+        border-radius: 999px; min-height: 4px;
     }
 
-    .volume-area { border-radius: 999px; }
-    .volume-area:hover { background-color: rgba(255, 255, 255, 0.04); }
-    .volume-area scale { padding: 0 16px 0 6px; min-width: 96px; }
+    /* Volume slider: blue accent, always inline (IINA-style). */
+    .volume-area scale { padding: 0 6px; min-width: 96px; }
+    .volume-area scale highlight { background-color: #3584e4; }
+    .volume-area scale slider { min-width: 12px; min-height: 12px; }
 
     .debug-overlay {
         background-color: rgba(0, 0, 0, 0.7);

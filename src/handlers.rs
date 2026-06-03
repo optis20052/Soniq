@@ -548,15 +548,7 @@ pub fn wire(
         });
     }
 
-    // ---------- Volume reveal-on-hover ----------
-    {
-        let revealer_in = ui.volume_revealer.clone();
-        let revealer_out = ui.volume_revealer.clone();
-        let motion = gtk::EventControllerMotion::new();
-        motion.connect_enter(move |_, _, _| revealer_in.set_reveal_child(true));
-        motion.connect_leave(move |_| revealer_out.set_reveal_child(false));
-        ui.volume_box.add_controller(motion);
-    }
+    // Volume slider is shown inline at all times now (no reveal-on-hover).
 
     // ---------- Fullscreen ----------
     {
@@ -840,10 +832,12 @@ fn install_timer(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState) {
                 }
             }
         }
-        if let Some(d) = dur
+        if let (Some(p), Some(d)) = (pos, dur)
             && d.nseconds() > 0
         {
-            duration_label.set_text(&format_time(d));
+            // Right-hand label shows time *remaining* (IINA-style, e.g. -1:23).
+            let remaining = gst::ClockTime::from_nseconds(d.nseconds().saturating_sub(p.nseconds()));
+            duration_label.set_text(&format!("-{}", format_time(remaining)));
         }
         if let (Some(p), Some(d)) = (pos, dur)
             && d.nseconds() > 0
@@ -1252,9 +1246,9 @@ fn install_overlay_chrome(ui: &UiHandles) {
                 const SIDE_GUTTER: i32 = 8; // min gap from each window edge
                 // Width of the seek row's fixed chrome (time labels + spacing +
                 // the bar's horizontal padding) — everything except the scale.
-                const SEEK_ROW_CHROME: i32 = 130;
+                const SEEK_ROW_CHROME: i32 = 150;
                 let avail = parent.width() - 2 * SIDE_GUTTER - SEEK_ROW_CHROME;
-                let target = avail.clamp(140, 340);
+                let target = avail.clamp(160, 460);
                 if seek_scale.width_request() != target {
                     seek_scale.set_width_request(target);
                 }
