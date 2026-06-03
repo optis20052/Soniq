@@ -115,7 +115,7 @@ impl AppState {
             effects: Effects::new(),
             subtitle_delay_ns: Rc::new(Cell::new(0)),
             subtitle_scale: Rc::new(Cell::new(1.0)),
-            subtitle_margin: Rc::new(Cell::new(96)),
+            subtitle_margin: Rc::new(Cell::new(40)),
             current_uri: Rc::new(RefCell::new(None)),
         }
     }

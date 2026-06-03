@@ -12,6 +12,10 @@ use crate::subtitles::SubtitleStyle;
 #[derive(Default, Serialize, Deserialize)]
 pub struct Config {
     pub subtitle_style: Option<SubtitleStyle>,
+    /// Subtitle size multiplier (the quick-settings "Scale").
+    pub subtitle_scale: Option<f64>,
+    /// Subtitle vertical offset / position (bottom margin in px).
+    pub subtitle_margin: Option<i32>,
     pub show_debug: Option<bool>,
     pub volume: Option<f64>,
     /// action key → GTK accelerator string.
@@ -58,6 +62,8 @@ pub fn from_state(state: &AppState) -> Config {
 
     Config {
         subtitle_style: Some(state.subtitles.style.lock().unwrap().clone()),
+        subtitle_scale: Some(state.subtitle_scale.get()),
+        subtitle_margin: Some(state.subtitle_margin.get()),
         show_debug: Some(state.show_debug.get()),
         volume: Some(state.volume.get()),
         shortcuts: Some(shortcuts),
@@ -71,6 +77,12 @@ pub fn from_state(state: &AppState) -> Config {
 pub fn apply_to_state(cfg: &Config, state: &AppState) {
     if let Some(style) = &cfg.subtitle_style {
         *state.subtitles.style.lock().unwrap() = style.clone();
+    }
+    if let Some(s) = cfg.subtitle_scale {
+        state.subtitle_scale.set(s.clamp(0.5, 3.0));
+    }
+    if let Some(m) = cfg.subtitle_margin {
+        state.subtitle_margin.set(m.clamp(0, 300));
     }
     if let Some(debug) = cfg.show_debug {
         state.show_debug.set(debug);

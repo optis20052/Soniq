@@ -47,8 +47,6 @@ pub fn wire(
         let osd = ui.osd.clone();
         let effects_load = state.effects.clone();
         let subtitle_delay_load = state.subtitle_delay_ns.clone();
-        let subtitle_scale_load = state.subtitle_scale.clone();
-        let subtitle_margin_load = state.subtitle_margin.clone();
         let current_uri_load = state.current_uri.clone();
         Rc::new(move |file: &gio::File| {
             let uri = file.uri();
@@ -90,14 +88,13 @@ pub fn wire(
             // volume to 100%, which would desync from the slider.
             pipeline.set_property("volume", volume_scale.value());
             pipeline.set_state(gst::State::Playing).ok();
-            // Reset all per-video quick settings to defaults for the new file
-            // (subtitle text-style stays global). Track lists repopulate when
-            // the panel is next opened (caps are only valid after preroll).
+            // Reset content-specific quick settings for the new file. Subtitle
+            // appearance (style/scale/position) is a user preference and is kept
+            // (and persisted); only the subtitle delay (a per-file sync offset)
+            // resets here. Track lists repopulate when the panel is next opened.
             *current_uri_load.borrow_mut() = Some(uri.to_string());
             effects_load.reset_for_new_video(&pipeline);
             subtitle_delay_load.set(0);
-            subtitle_scale_load.set(1.0);
-            subtitle_margin_load.set(96);
             play_btn.set_icon_name("media-playback-pause-symbolic");
             content_stack.set_visible_child_name("video");
             controls.set_visible(true);
@@ -1768,6 +1765,20 @@ fn build_subtitles_page(
     }
     group.add(&pos_row);
 
+    // --- Vertical offset (moves bottom-aligned subtitles up/down) ---
+    let (offset_row, offset_scale) =
+        qs_slider("Vertical offset", 0.0, 300.0, 4.0, margin.get() as f64);
+    {
+        let margin = margin.clone();
+        let apply = apply.clone();
+        offset_scale.connect_value_changed(move |s| {
+            margin.set(s.value() as i32);
+            apply();
+        });
+    }
+    offset_row.add_suffix(&qs_reset(&offset_scale, 40.0));
+    group.add(&offset_row);
+
     let page = adw::PreferencesPage::builder()
         .title("Subtitles")
         .icon_name("media-view-subtitles-symbolic")
@@ -2838,7 +2849,7 @@ fn build_subtitle_qs_page(
             apply();
         });
     }
-    pos_row.add_suffix(&qs_reset(&pos_scale, 96.0));
+    pos_row.add_suffix(&qs_reset(&pos_scale, 40.0));
     timing.add(&pos_row);
 
     let (scale_row, scale_scale) = qs_slider("Scale", 0.5, 3.0, 0.05, state.subtitle_scale.get());

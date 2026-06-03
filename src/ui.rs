@@ -405,7 +405,7 @@ pub fn build_ui(app: &adw::Application, paintable: &gdk::Paintable) -> UiHandles
     subtitle_label.set_valign(gtk::Align::End);
     subtitle_label.set_justify(gtk::Justification::Center);
     subtitle_label.set_wrap(true);
-    subtitle_label.set_margin_bottom(96); // clear the controls bar
+    subtitle_label.set_margin_bottom(40); // small default gap from the bottom
     subtitle_label.set_margin_start(40);
     subtitle_label.set_margin_end(40);
     subtitle_label.set_visible(false);
