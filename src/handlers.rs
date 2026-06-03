@@ -1793,6 +1793,10 @@ fn install_mouse_clicks(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState
     let last_user_seek = state.last_user_seek.clone();
     let mouse = state.mouse.clone();
 
+    // Clone for the cancel handler before `pending_single` is moved into the
+    // pressed closure below.
+    let pending_single_cancel = pending_single.clone();
+
     gesture.connect_pressed(move |_, n_press, _, _| {
         if n_press == 1 {
             // Tentatively schedule the single-click action.
@@ -1853,7 +1857,52 @@ fn install_mouse_clicks(ui: &UiHandles, pipe: &PipelineHandles, state: &AppState
             }
         }
     });
+    // If the press turns into a window-move drag (below), the click gesture is
+    // cancelled by the compositor grab — void any pending single-click so the
+    // drag doesn't also toggle play/pause.
+    gesture.connect_cancel(move |_, _| {
+        pending_single_cancel.set(pending_single_cancel.get().wrapping_add(1));
+    });
     ui.picture.add_controller(gesture);
+
+    // Drag anywhere on the video to move the window. We hand off to the
+    // compositor (Toplevel::begin_move) once the pointer passes a small
+    // threshold, so plain clicks still toggle play/pause. The controls panel is
+    // a separate overlay child and intercepts its own events, so it's excluded.
+    {
+        let window = ui.window.clone();
+        let move_drag = gtk::GestureDrag::new();
+        move_drag.set_button(gdk::BUTTON_PRIMARY);
+        let moving = Rc::new(Cell::new(false));
+        {
+            let moving = moving.clone();
+            move_drag.connect_drag_begin(move |_, _, _| moving.set(false));
+        }
+        {
+            let moving = moving.clone();
+            let window = window.clone();
+            move_drag.connect_drag_update(move |g, off_x, off_y| {
+                if moving.get() || off_x.hypot(off_y) < 8.0 {
+                    return;
+                }
+                moving.set(true);
+                let Some(surface) = window.surface() else { return };
+                let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() else {
+                    return;
+                };
+                let Some(device) = g.current_event_device() else { return };
+                let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
+                toplevel.begin_move(
+                    &device,
+                    g.current_button() as i32,
+                    sx,
+                    sy,
+                    g.current_event_time(),
+                );
+            });
+        }
+        ui.picture.add_controller(move_drag);
+    }
 }
 
 /// Right-click anywhere on the player surface opens a small menu with
