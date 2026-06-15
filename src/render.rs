@@ -126,11 +126,18 @@ pub fn install(app: &App, deps: RenderDeps) {
                 }
             }
             slint::RenderingState::BeforeRendering => {
-                // Deliver any files dropped onto the window (Wayland path).
-                if let Some(d) = dnd_rn.borrow_mut().as_mut() {
-                    for path in d.pump() {
-                        handle_drop_rn(path);
-                    }
+                // Deliver any files dropped onto the window (Wayland path). Defer
+                // the actual load to the next event-loop turn: handling it inline
+                // would mutate UI state / resize the window from *inside* the Skia
+                // render callback, re-entering the renderer's borrowed RefCell and
+                // aborting ("RefCell already mutably borrowed" on drop).
+                let dropped: Vec<String> = match dnd_rn.borrow_mut().as_mut() {
+                    Some(d) => d.pump(),
+                    None => Vec::new(),
+                };
+                for path in dropped {
+                    let handle = handle_drop_rn.clone();
+                    slint::Timer::single_shot(Duration::from_millis(0), move || handle(path));
                 }
                 if std::env::var("SONIQ_FPS").is_ok() {
                     use std::cell::Cell;
