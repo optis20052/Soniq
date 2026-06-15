@@ -1,0 +1,2760 @@
+// Soniq — Slint UI reproducing the original GTK4/libadwaita design,
+// with settings drawer, URL dialog, OSD, resume, recents and shortcuts.
+
+// ListView virtualizes its rows — only the visible delegates are built, so the
+// 200+-entry font picker opens instantly instead of instantiating every row.
+import { ListView, LineEdit } from "std-widgets.slint";
+
+// Bumped whenever a window resizes; open dropdown/picker popups watch it and
+// close themselves (a PopupWindow is anchored at show-time and otherwise stays
+// detached at stale coordinates when the window grows/shrinks).
+global Reflow {
+    in-out property <int> token: 0;
+}
+
+struct TrackUi {
+    id: int,
+    label: string,
+    selected: bool,
+}
+
+struct RecentUi {
+    path: string,
+    title: string,
+    subtitle: string,
+    is-stream: bool,
+}
+
+// One row of the playback queue (the current folder's files).
+struct QueueItem {
+    title: string,
+    current: bool,
+}
+
+struct ShortcutItem {
+    title: string,
+    keys: string,
+}
+
+// A preferences search result (Rust filters; Slint has no string.contains).
+struct SearchHit {
+    title: string,
+    category: string,
+    page: int,
+}
+
+// Normalises a key event into a stable label like "Space", "Ctrl+o", "Left".
+export global KeyName {
+    public pure function of(text: string, ctrl: bool, alt: bool, shift: bool) -> string {
+        return (ctrl ? "Ctrl+" : "") + (alt ? "Alt+" : "") + (shift ? "Shift+" : "")
+            + (text == Key.Space ? "Space"
+            : text == Key.LeftArrow ? "Left"
+            : text == Key.RightArrow ? "Right"
+            : text == Key.UpArrow ? "Up"
+            : text == Key.DownArrow ? "Down"
+            : text == Key.Home ? "Home"
+            : text == Key.End ? "End"
+            : text == Key.Return ? "Enter"
+            : text == Key.Escape ? "Esc"
+            : text);
+    }
+}
+
+// ---------- round OSD icon button ----------
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <length> box: 30px;
+    in property <length> glyph: 18px;
+    // Icons have their colour baked into the SVG (white). `dim` approximates
+    // the old tint alphas via plain opacity — `colorize` is an image-filter
+    // whose Skia cache gets corrupted by fullscreen surface recreation
+    // (icons turned into solid blocks).
+    in property <float> dim: 0.92;
+    in property <color> hover-bg: #ffffff26;
+    in property <bool> danger: false;
+    // Chrome fade factor (0..1). Applied per-leaf (background colour + image
+    // alpha) instead of element `opacity`: opacity on an element WITH children
+    // renders through a Skia layer, and layers half-update / corrupt on this
+    // stack (the control bar showed up in halves while fading).
+    in property <float> fade: 1.0;
+    callback clicked;
+
+    // GTK-style: press-and-drag on a button drags whatever hosts it (e.g. the
+    // floating control bar) instead of clicking; a clean press still clicks.
+    callback drag-by(length, length);
+    property <length> acc: 0;
+    property <bool> dragged: false;
+
+    // Fixed width, but height stretches to the row — so the round hit-circle
+    // (a centred lone child) ends up vertically centred in the row.
+    width: box;
+
+    // Hover transition on its own animated float: an `animate background`
+    // would ALSO re-animate the colour changes coming from `fade`, making
+    // this element lag the rest of the chrome during show/hide.
+    property <float> hover-t: ta.has-hover ? 1.0 : 0.0;
+    animate hover-t { duration: 120ms; }
+    circle := Rectangle {
+        width: box;
+        height: box;
+        border-radius: box / 2;
+        background: (root.danger ? #e8433eD9 : root.hover-bg)
+            .transparentize(1 - root.hover-t)
+            .transparentize(1 - root.fade);
+        Image {
+            width: root.glyph;
+            height: root.glyph;
+            source: root.icon;
+            opacity: root.dim * root.fade;
+        }
+    }
+    ta := TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.acc = 0px;
+                root.dragged = false;
+            }
+        }
+        moved => {
+            root.acc += Math.abs(self.mouse-x - self.pressed-x) + Math.abs(self.mouse-y - self.pressed-y);
+            if (root.acc > 6px) {
+                root.dragged = true;
+            }
+            if (root.dragged) {
+                root.drag-by(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+            }
+        }
+        clicked => {
+            if (!root.dragged) {
+                root.clicked();
+            }
+        }
+    }
+}
+
+// ---------- filled hero play / pause button ----------
+component HeroButton inherits Rectangle {
+    in property <bool> paused;
+    // Per-leaf chrome fade — see IconButton.
+    in property <float> fade: 1.0;
+    callback clicked;
+    callback drag-by(length, length);
+    property <length> acc: 0;
+    property <bool> dragged: false;
+    width: 46px;
+    height: 46px;
+    border-radius: 23px;
+    // Hover on its own float — see IconButton (animate background would lag
+    // the chrome fade: the play circle lingered after everything else hid).
+    property <float> hover-t: ta.has-hover ? 1.0 : 0.0;
+    animate hover-t { duration: 140ms; }
+    background: #ffffffd1.mix(#ffffff, 1 - self.hover-t).transparentize(1 - root.fade);
+    // Two stacked images toggled by `visible` — swapping the `source` of a
+    // colorized Image breaks its render cache (it paints a solid block).
+    Image {
+        width: 22px;
+        height: 22px;
+        visible: root.paused;
+        source: @image-url("icons/play.svg");
+        opacity: root.fade;
+    }
+    Image {
+        width: 22px;
+        height: 22px;
+        visible: !root.paused;
+        source: @image-url("icons/pause.svg");
+        opacity: root.fade;
+    }
+    ta := TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.acc = 0px;
+                root.dragged = false;
+            }
+        }
+        moved => {
+            root.acc += Math.abs(self.mouse-x - self.pressed-x) + Math.abs(self.mouse-y - self.pressed-y);
+            if (root.acc > 6px) {
+                root.dragged = true;
+            }
+            if (root.dragged) {
+                root.drag-by(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+            }
+        }
+        clicked => {
+            if (!root.dragged) {
+                root.clicked();
+            }
+        }
+    }
+}
+
+// ---------- slider (seek + volume) ----------
+component Slider inherits Rectangle {
+    in property <float> value;          // 0..1
+    in property <float> secondary;      // 0..1 (buffer band)
+    in property <color> accent: #ffffffeb;
+    in property <length> knob: 13px;
+    // Per-leaf chrome fade — see IconButton.
+    in property <float> fade: 1.0;
+    // Hover-to-preview time tooltip (seek bar only): give it the total duration.
+    in property <bool> show-hover-time: false;
+    in property <float> duration: 0;
+    callback changed(float);
+    callback committed(float);   // fires once when the drag is released
+
+    // time at the hovered x, formatted M:SS / H:MM:SS
+    property <float> hover-frac: Math.clamp(ta.mouse-x / root.width, 0, 1);
+    property <int> hover-secs: Math.round(root.hover-frac * root.duration);
+    property <int> hov-h: Math.floor(root.hover-secs / 3600);
+    property <int> hov-m: Math.mod(Math.floor(root.hover-secs / 60), 60);
+    property <int> hov-s: Math.mod(root.hover-secs, 60);
+    property <string> hov-mm: root.hov-m < 10 ? "0\{root.hov-m}" : "\{root.hov-m}";
+    property <string> hov-ss: root.hov-s < 10 ? "0\{root.hov-s}" : "\{root.hov-s}";
+    property <string> hover-label: root.hov-h > 0
+        ? "\{root.hov-h}:\{root.hov-mm}:\{root.hov-ss}"
+        : "\{root.hov-m}:\{root.hov-ss}";
+
+    horizontal-stretch: 1;
+    min-height: 16px;
+
+    // While dragging, follow the cursor (drag-value). `dragging` is bound to the
+    // press state so it can't get stuck. After release we keep showing the
+    // release position for a moment (`settling`) until mpv's position catches up
+    // — otherwise the knob snaps back to the keyframe position then jumps forward.
+    property <float> drag-value: 0;
+    property <bool> dragging: ta.pressed;
+    property <float> release-value: 0;
+    property <bool> settling: false;
+    property <float> shown:
+        root.dragging ? root.drag-value
+        : root.settling ? root.release-value
+        : Math.clamp(root.value, 0, 1);
+
+    // Clear `settling` once mpv's reported position actually reaches the release
+    // point (so the knob never jumps to a stale/in-flight position). The timer is
+    // just a safety net if the seek never lands exactly.
+    changed value => {
+        if (root.settling && Math.abs(Math.clamp(root.value, 0, 1) - root.release-value) < 0.004) {
+            root.settling = false;
+        }
+    }
+    settle-timer := Timer {
+        interval: 2000ms;
+        running: root.settling;
+        triggered => { root.settling = false; }
+    }
+
+    track := Rectangle {
+        y: (parent.height - 4px) / 2;
+        height: 4px;
+        width: 100%;
+        border-radius: 2px;
+        background: #ffffff24.transparentize(1 - root.fade);
+        Rectangle {
+            x: 0;
+            height: 100%;
+            width: parent.width * Math.clamp(root.secondary, 0, 1);
+            border-radius: 2px;
+            background: #ffffff6b.transparentize(1 - root.fade);
+        }
+        Rectangle {
+            x: 0;
+            height: 100%;
+            width: parent.width * root.shown;
+            border-radius: 2px;
+            background: root.accent.transparentize(1 - root.fade);
+        }
+    }
+    Rectangle {
+        width: root.knob;
+        height: root.knob;
+        border-radius: root.knob / 2;
+        x: (root.width - root.knob) * root.shown;
+        y: (parent.height - self.height) / 2;
+        background: white.transparentize(1 - root.fade);
+        // NB: no drop-shadow — Skia's shadow blur cache gets corrupted by the
+        // fullscreen-exit surface recreation on this stack and paints the
+        // shadow as a solid black square around the knob.
+    }
+    ta := TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.settling = false;
+                root.drag-value = Math.clamp(self.mouse-x / root.width, 0, 1);
+                root.changed(root.drag-value);
+            } else if (e.kind == PointerEventKind.up) {
+                root.release-value = root.drag-value;
+                root.settling = true;
+                root.committed(root.drag-value);
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.drag-value = Math.clamp(self.mouse-x / root.width, 0, 1);
+                root.changed(root.drag-value);
+            }
+        }
+    }
+
+    // Hover preview bubble (IINA-style): the time you'd seek to, above the cursor.
+    if root.show-hover-time && ta.has-hover && root.duration > 0: Rectangle {
+        x: Math.clamp(ta.mouse-x - self.width / 2, 0, root.width - self.width);
+        y: -34px;
+        width: hov-lbl.preferred-width + 18px;
+        height: 26px;
+        border-radius: 7px;
+        background: #000000e0;
+        border-width: 1px;
+        border-color: #ffffff26;
+        hov-lbl := Text {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            text: root.hover-label;
+            color: #ffffff; font-size: 12px; font-weight: 600;
+        }
+    }
+}
+
+// ---------- top bar ----------
+component TopBar inherits Rectangle {
+    in property <string> title-text;
+    callback open-file;
+    callback open-url;
+    callback settings;
+    callback minimize;
+    callback maximize;
+    callback close;
+    callback drag;
+    // Hidden when the OS provides native window buttons (macOS traffic lights).
+    in property <bool> window-controls: true;
+    // Per-leaf chrome fade — see IconButton.
+    in property <float> fade: 1.0;
+
+    height: 46px;
+    // The fade itself lives in a taller veil element behind this bar (one
+    // smooth slope — a multi-stop curve Mach-bands, and a gradient that stops
+    // at the bar's bottom edge reads as a band). The "black splash at the
+    // corner" was never this gradient: it was the corner punch fading BLACK
+    // in instead of the scene out (fixed in video.rs::erase_corners_on).
+    background: transparent;
+
+    // Window-drag handle for the frameless window: covers the whole bar; the
+    // buttons are later children so they stay clickable. Double-click maximizes.
+    // Disabled while the chrome is faded out, so it can't eat the pointer
+    // motion that reveals the chrome in the first place.
+    TouchArea {
+        enabled: root.fade > 0.1;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.drag();
+            }
+        }
+        double-clicked => { root.maximize(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 8px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 2px;
+            alignment: start;
+            IconButton {
+                icon: @image-url("icons/open.svg");
+                fade: root.fade;
+                clicked => { root.open-file(); }
+            }
+            IconButton {
+                icon: @image-url("icons/link.svg");
+                fade: root.fade;
+                clicked => { root.open-url(); }
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            Text {
+                text: root.title-text;
+                color: #fffffff2.transparentize(1 - root.fade);
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+                width: parent.width;
+                horizontal-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: 2px;
+            alignment: end;
+            IconButton {
+                icon: @image-url("icons/gear.svg");
+                fade: root.fade;
+                clicked => { root.settings(); }
+            }
+            if root.window-controls: IconButton {
+                icon: @image-url("icons/minimize.svg");
+                fade: root.fade;
+                clicked => { root.minimize(); }
+            }
+            if root.window-controls: IconButton {
+                icon: @image-url("icons/maximize.svg");
+                fade: root.fade;
+                clicked => { root.maximize(); }
+            }
+            if root.window-controls: IconButton {
+                icon: @image-url("icons/close.svg");
+                danger: true;
+                fade: root.fade;
+                clicked => { root.close(); }
+            }
+        }
+    }
+}
+
+// ---------- floating control bar ----------
+component ControlBar inherits Rectangle {
+    in property <bool> paused;
+    in property <bool> muted;
+    in property <float> progress;
+    in property <float> buffered;
+    in property <float> volume;
+    in property <string> position-text;
+    in property <string> duration-text;
+    in property <float> duration-secs;
+    callback toggle-pause;
+    callback seek(float);
+    callback seek-commit(float);
+    callback set-volume(float);
+    callback toggle-mute;
+    callback prev;
+    callback next;
+    callback stop;
+    callback subtitles;
+    callback settings;
+    callback fullscreen;
+    callback playlist;
+    callback moved-by(length, length);
+    callback hovered;
+    // Per-leaf chrome fade — see IconButton.
+    in property <float> fade: 1.0;
+
+    height: content.preferred-height;
+    background: #1e1e22b8.transparentize(1 - root.fade);
+    border-width: 1px;
+    border-color: #ffffff12.transparentize(1 - root.fade);
+    border-radius: 18px;
+
+    drag := TouchArea {
+        mouse-cursor: move;
+        changed mouse-x => { root.hovered(); }
+        changed mouse-y => { root.hovered(); }
+        moved => {
+            root.moved-by(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+        }
+    }
+
+    content := VerticalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        padding-top: 10px;
+        padding-bottom: 12px;
+        spacing: 8px;
+
+        Rectangle {
+            height: 46px;
+            HorizontalLayout {
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 4px;
+                    alignment: start;
+                    // Two overlaid buttons toggled by `visible` (swapping a
+                    // colorized Image's source paints a solid block).
+                    Rectangle {
+                        width: 30px;
+                        IconButton {
+                        fade: root.fade;
+                            visible: !root.muted;
+                            icon: @image-url("icons/volume.svg");
+                            clicked => { root.toggle-mute(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                        }
+                        IconButton {
+                        fade: root.fade;
+                            visible: root.muted;
+                            icon: @image-url("icons/mute.svg");
+                            clicked => { root.toggle-mute(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                        }
+                    }
+                    Slider {
+                        fade: root.fade;
+                        width: 96px;
+                        accent: #3584e4;
+                        knob: 12px;
+                        value: root.volume;
+                        changed(v) => { root.set-volume(v); }
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 2px;
+                    alignment: end;
+                    IconButton {
+                        fade: root.fade;
+                        icon: @image-url("icons/stop.svg");
+                        box: 26px; glyph: 15px; dim: 0.78;
+                        clicked => { root.stop(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                    }
+                    IconButton {
+                        fade: root.fade;
+                        icon: @image-url("icons/queue.svg");
+                        box: 26px; glyph: 15px; dim: 0.78;
+                        clicked => { root.playlist(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                    }
+                    IconButton {
+                        fade: root.fade;
+                        icon: @image-url("icons/subtitles.svg");
+                        box: 26px; glyph: 15px; dim: 0.78;
+                        clicked => { root.subtitles(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                    }
+                    IconButton {
+                        fade: root.fade;
+                        icon: @image-url("icons/gear.svg");
+                        box: 26px; glyph: 15px; dim: 0.78;
+                        clicked => { root.settings(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                    }
+                    IconButton {
+                        fade: root.fade;
+                        icon: @image-url("icons/fullscreen.svg");
+                        box: 26px; glyph: 15px; dim: 0.78;
+                        clicked => { root.fullscreen(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                    }
+                }
+            }
+            // Transport cluster overlaid dead-centre on the bar. In the flow it
+            // was centred in the *leftover* space, so the wider volume section
+            // pushed it off the true centre (GTK centred it on the bar).
+            HorizontalLayout {
+                x: (parent.width - self.width) / 2;
+                y: 0;
+                width: self.preferred-width;
+                height: parent.height;
+                spacing: 14px;
+                IconButton {
+                        fade: root.fade;
+                    icon: @image-url("icons/prev.svg");
+                    clicked => { root.prev(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                }
+                HeroButton {
+                    fade: root.fade;
+                    paused: root.paused;
+                    clicked => { root.toggle-pause(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                }
+                IconButton {
+                        fade: root.fade;
+                    icon: @image-url("icons/next.svg");
+                    clicked => { root.next(); }
+                        drag-by(dx, dy) => { root.moved-by(dx, dy); }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text {
+                text: root.position-text;
+                color: #ffffff9e.transparentize(1 - root.fade);
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                min-width: 38px;
+            }
+            Slider {
+                fade: root.fade;
+                value: root.progress;
+                secondary: root.buffered;
+                show-hover-time: true;
+                duration: root.duration-secs;
+                changed(v) => { root.seek(v); }
+                committed(v) => { root.seek-commit(v); }
+            }
+            Text {
+                text: root.duration-text;
+                color: #ffffff9e.transparentize(1 - root.fade);
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                min-width: 44px;
+            }
+        }
+    }
+}
+
+// ---------- pill button ----------
+component Pill inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    // Primary fill — defaults to the app blue; override for a neutral button.
+    in property <brush> primary-bg: #3584e4;
+    in property <brush> primary-bg-hover: #4593f0;
+    // Horizontal padding — the home screen uses the wider GTK spacing (22px).
+    in property <length> pad: 18px;
+    callback clicked;
+    height: 34px;
+    border-radius: self.height / 2;
+    border-width: root.primary ? 0px : 1px;
+    border-color: #ffffff1a;
+    background: root.primary
+        ? (ta.has-hover ? root.primary-bg-hover : root.primary-bg)
+        : (ta.has-hover ? #ffffff2e : #ffffff1a);
+    animate background { duration: 120ms; }
+    HorizontalLayout {
+        padding-left: root.pad;
+        padding-right: root.pad;
+        // Centre the label so the pill can never lean if a layout stretches it.
+        alignment: center;
+        Text {
+            text: root.label;
+            color: #fffffff2;
+            font-weight: 600;
+            font-size: 14px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// ---------- quick-settings drawer (slides from the right) ----------
+component TrackRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked;
+    height: 38px;
+    border-radius: 9px;
+    background: ta.has-hover ? #ffffff14 : (root.selected ? #ffffff0f : transparent);
+    animate background { duration: 100ms; }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+        Text {
+            text: root.selected ? "✓" : "";
+            color: #4593f0;
+            font-size: 14px;
+            width: 16px;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: root.selected ? #ffffff : #ffffffd1;
+            font-size: 14px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component DrawerTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    in property <bool> has-icon: false;
+    in property <image> icon;
+    callback clicked;
+    height: 44px;
+    border-radius: 11px;
+    background: root.active ? #ffffff14 : (ta.has-hover ? #ffffff0a : transparent);
+    animate background { duration: 100ms; }
+    // accent bar on the active tab
+    Rectangle {
+        x: 0; width: 3px; height: 18px; y: (parent.height - self.height) / 2;
+        border-radius: 1.5px;
+        background: #3584e4;
+        opacity: root.active ? 1 : 0;
+        animate opacity { duration: 100ms; }
+    }
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 12px;
+        spacing: 11px;
+        if root.has-icon: Rectangle {
+            width: 18px;
+            Image {
+                width: 18px; height: 18px;
+                source: root.icon;
+                opacity: root.active ? 1.0 : 0.6;
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.active ? #ffffff : #ffffffb0;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// ===== grouped-settings building blocks (adw look) =====
+// Inset hairline between rows inside a GroupCard (Adwaita list-row separator).
+component RowSep inherits Rectangle {
+    height: 1px;
+    HorizontalLayout {
+        padding-left: 16px; padding-right: 16px;
+        Rectangle { background: #ffffff0f; }
+    }
+}
+component GroupCard inherits VerticalLayout {
+    in property <string> title;
+    spacing: 9px;
+    Text {
+        visible: root.title != "";
+        text: root.title.to-uppercase();
+        color: #ffffff7a; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+    }
+    Rectangle {
+        background: #1f1f25;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: #ffffff12;
+        VerticalLayout { padding: 4px; @children }
+    }
+}
+
+component Switch inherits Rectangle {
+    in-out property <bool> on;
+    callback toggled(bool);
+    width: 42px; height: 24px; border-radius: 12px;
+    background: root.on ? #3584e4 : #ffffff2e;
+    animate background { duration: 120ms; }
+    Rectangle {
+        width: 18px; height: 18px; border-radius: 9px; background: white;
+        x: root.on ? parent.width - self.width - 3px : 3px;
+        y: 3px;
+        animate x { duration: 120ms; }
+    }
+    TouchArea { clicked => { root.on = !root.on; root.toggled(root.on); } }
+}
+
+component SwitchRow inherits Rectangle {
+    in property <string> title;
+    in-out property <bool> on;
+    callback toggled(bool);
+    height: 54px;
+    HorizontalLayout {
+        padding-left: 16px; padding-right: 16px;
+        Text { text: root.title; color: #fffffff2; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+        Rectangle { width: 42px; Switch { on <=> root.on; toggled(v) => { root.toggled(v); } } }
+    }
+}
+
+component Combo inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current: 0;
+    callback changed(int);
+    height: 30px;
+    border-radius: 8px;
+    background: ta.has-hover ? #ffffff24 : #ffffff14;
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 8px; spacing: 4px;
+        Text {
+            text: (root.current >= 0 && root.current < root.options.length) ? root.options[root.current] : "";
+            color: #ffffff; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+        }
+        Text { text: "▾"; color: #ffffff8c; font-size: 12px; vertical-alignment: center; }
+    }
+    ta := TouchArea { clicked => { popup.show(); } }
+    // Close the dropdown if the window resizes (the popup would otherwise
+    // detach to stale coordinates).
+    property <int> rf: Reflow.token;
+    changed rf => { popup.close(); }
+    popup := PopupWindow {
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        x: 0; y: parent.height + 2px; width: root.width;
+        Rectangle {
+            background: #26262c; border-radius: 8px; border-width: 1px; border-color: #ffffff24;
+            VerticalLayout {
+                padding: 4px;
+                for opt[i] in root.options: Rectangle {
+                    height: 30px; border-radius: 6px;
+                    background: ita.has-hover ? #ffffff24 : transparent;
+                    HorizontalLayout { padding-left: 10px;
+                        Text { text: opt; color: #ffffff; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                    }
+                    ita := TouchArea { clicked => { root.current = i; root.changed(i); popup.close(); } }
+                }
+            }
+        }
+    }
+}
+
+component ComboRow inherits Rectangle {
+    in property <string> title;
+    in property <[string]> options;
+    in-out property <int> current: 0;
+    callback changed(int);
+    height: 54px;
+    HorizontalLayout {
+        padding-left: 16px; padding-right: 16px; spacing: 8px;
+        Text { text: root.title; color: #fffffff2; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+        Rectangle { width: 160px; Combo { width: 160px; options: root.options; current <=> root.current; changed(i) => { root.changed(i); } } }
+    }
+}
+
+// Searchable system-font picker row (replaces the 3-item font combo). Opens a
+// popup with a search field + scrollable family list; Rust filters `options`
+// in response to `search`, and a click emits `picked`.
+component FontPickerRow inherits Rectangle {
+    in property <string> title: "Font";
+    in property <string> current-name;
+    in property <[string]> options;
+    callback search(string);
+    callback picked(string);
+    height: 54px;
+    HorizontalLayout {
+        padding-left: 16px; padding-right: 16px; spacing: 8px;
+        Text { text: root.title; color: #fffffff2; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+        Rectangle {
+            width: 200px;
+            field := Rectangle {
+                height: 30px;
+                border-radius: 8px;
+                background: fta.has-hover ? #ffffff24 : #ffffff14;
+                HorizontalLayout {
+                    padding-left: 10px; padding-right: 8px; spacing: 4px;
+                    Text {
+                        text: root.current-name;
+                        color: #ffffff; font-size: 13px; vertical-alignment: center;
+                        horizontal-stretch: 1; overflow: elide;
+                    }
+                    Text { text: "▾"; color: #ffffff8c; font-size: 12px; vertical-alignment: center; }
+                }
+                fta := TouchArea { clicked => { root.search(""); popup.show(); } }
+            }
+            // Close on window resize (see Combo).
+            property <int> rf: Reflow.token;
+            changed rf => { popup.close(); }
+            popup := PopupWindow {
+                close-policy: PopupClosePolicy.close-on-click-outside;
+                x: 0; y: field.height + 2px; width: 240px;
+                // Route keystrokes to the search field even before it's clicked.
+                forward-focus: sin;
+                Rectangle {
+                    background: #26262c; border-radius: 8px; border-width: 1px; border-color: #ffffff24;
+                    VerticalLayout {
+                        padding: 6px; spacing: 6px;
+                        // search box
+                        Rectangle {
+                            height: 32px;
+                            background: #00000059;
+                            border-radius: 7px;
+                            border-width: 1px;
+                            border-color: sin.has-focus ? #4593f0 : #ffffff1f;
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px; spacing: 6px;
+                                Text { text: "🔍"; font-size: 12px; color: #ffffff8c; vertical-alignment: center; }
+                                sin := TextInput {
+                                    color: #ffffff; font-size: 13px; vertical-alignment: center;
+                                    single-line: true;
+                                    edited => { root.search(self.text); }
+                                }
+                            }
+                        }
+                        // virtualized family list (only visible rows are built)
+                        ListView {
+                            width: 228px;
+                            height: 260px;
+                            for f in root.options: Rectangle {
+                                height: 31px; border-radius: 6px;
+                                background: lrowa.has-hover ? #ffffff24
+                                    : (f == root.current-name ? #ffffff14 : transparent);
+                                HorizontalLayout {
+                                    padding-left: 10px; padding-right: 10px;
+                                    Text { text: f; color: #ffffff; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                }
+                                lrowa := TouchArea { clicked => { root.picked(f); popup.close(); } }
+                            }
+                        }
+                    }
+                }
+                init => { sin.focus(); }
+            }
+        }
+    }
+}
+
+component SliderRow inherits VerticalLayout {
+    in property <string> title;
+    in property <float> min;
+    in property <float> max;
+    in property <float> default-val;
+    in property <int> decimals: 2;
+    in property <string> unit: "";
+    in property <bool> enabled: true;
+    callback changed(float);
+    property <float> val: default-val;
+    padding-left: 16px; padding-right: 16px; padding-top: 12px; padding-bottom: 12px;
+    spacing: 6px;
+    opacity: root.enabled ? 1.0 : 0.4;
+    HorizontalLayout {
+        spacing: 6px;
+        Text { text: root.title; color: #fffffff2; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+        Text {
+            text: (root.decimals == 0 ? Math.round(root.val) : Math.round(root.val * 100) / 100) + root.unit;
+            color: #ffffff; font-size: 13px; font-weight: 600; vertical-alignment: center;
+        }
+        Rectangle { width: 22px; height: 22px; border-radius: 11px;
+            background: rta.has-hover ? #ffffff1f : transparent;
+            Text { text: "⟲"; color: #ffffff8c; font-size: 13px; }
+            rta := TouchArea { enabled: root.enabled; clicked => { root.val = root.default-val; root.changed(root.val); } }
+        }
+    }
+    Slider {
+        accent: #3584e4;
+        value: (root.val - root.min) / (root.max - root.min);
+        changed(n) => { if (root.enabled) { root.val = root.min + n * (root.max - root.min); root.changed(root.val); } }
+    }
+}
+
+// ===== quick-settings drawer =====
+// ---------- playback queue (slides from the right, like the drawer) ----------
+component QueuePanel inherits Rectangle {
+    in property <[QueueItem]> items;
+    in property <bool> open;
+    callback play(int);
+    callback close;
+
+    // Delayed-hover tooltip showing the full (elided) file name.
+    property <string> tip-text;
+    property <length> tip-top;
+    property <bool> tip-shown;
+
+    width: 340px;
+    background: #1c1c20f7;
+    border-width: 1px;
+    border-color: #ffffff14;
+
+    // swallow clicks on the panel so they don't fall through to the dismiss
+    // backdrop behind it (and don't leak to the chrome underneath).
+    TouchArea {}
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: "Playlist"; color: #ffffff; font-size: 15px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+            Text {
+                text: root.items.length + (root.items.length == 1 ? " file" : " files");
+                color: #ffffff80; font-size: 12px; vertical-alignment: center;
+            }
+            IconButton { icon: @image-url("icons/close.svg"); box: 28px; glyph: 15px; clicked => { root.close(); } }
+        }
+        Rectangle { height: 1px; background: #ffffff14; }
+
+        ListView {
+            vertical-stretch: 1;
+            // Each list slot is taller than its visible row, so the inset row
+            // leaves a gap above/below — the rows don't butt up against each other.
+            for item[i] in root.items: Rectangle {
+                height: 52px;
+                row := Rectangle {
+                    y: 3px;
+                    height: 46px;
+                    border-radius: 9px;
+                    // Now-playing row is clearly blue-tinted (the app's active
+                    // accent); hover on other rows is a neutral grey.
+                    background: item.current
+                        ? (qa.has-hover ? #3584e459 : #3584e440)
+                        : (qa.has-hover ? #ffffff14 : transparent);
+                    animate background { duration: 100ms; }
+                    // Show the full name as a tooltip after ~1s of hovering;
+                    // hide it the moment the pointer leaves this row.
+                    property <bool> hov: qa.has-hover;
+                    changed hov => {
+                        if (!row.hov && root.tip-text == item.title) { root.tip-shown = false; }
+                    }
+                    tip-timer := Timer {
+                        interval: 1000ms;
+                        running: row.hov && !(root.tip-shown && root.tip-text == item.title);
+                        triggered => {
+                            root.tip-text = item.title;
+                            root.tip-top = row.absolute-position.y - root.absolute-position.y;
+                            root.tip-shown = true;
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 10px; spacing: 10px;
+                        // index / now-playing indicator
+                        Rectangle {
+                            width: 18px;
+                            Image {
+                                width: 13px; height: 13px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                source: @image-url("icons/play.svg");
+                                visible: item.current;
+                                opacity: 0.9;
+                            }
+                            Text {
+                                text: i + 1;
+                                visible: !item.current;
+                                color: #ffffff5e; font-size: 12px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                        Text {
+                            text: item.title;
+                            color: item.current ? #ffffff : #ffffffce;
+                            font-size: 13px;
+                            font-weight: item.current ? 700 : 400;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                    qa := TouchArea { clicked => { root.play(i); } }
+                }
+            }
+        }
+    }
+
+    // Tooltip overlay — rendered above the list (outside the ListView) so it's
+    // not clipped; char-wraps the full name to fit the panel width. Always
+    // present so it can fade/slide; per-leaf alpha (NOT element opacity, which
+    // corrupts over children on this stack) + a small slide-up.
+    tip := Rectangle {
+        property <float> f: root.tip-shown ? 1.0 : 0.0;
+        animate f { duration: 130ms; easing: ease-out; }
+        visible: self.f > 0.01;
+        x: 10px;
+        y: Math.clamp(root.tip-top + 50px, 50px, root.height - self.height - 10px) + 7px * (1 - self.f);
+        width: parent.width - 20px;
+        height: tip-lbl.preferred-height + 16px;
+        background: #000000ed.transparentize(1 - tip.f);
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #ffffff2e.transparentize(1 - tip.f);
+        tip-lbl := Text {
+            x: 10px;
+            y: 8px;
+            width: parent.width - 20px;
+            text: root.tip-text;
+            color: #ffffff.transparentize(1 - tip.f);
+            font-size: 12px;
+            wrap: char-wrap;
+        }
+    }
+}
+
+component Drawer inherits Rectangle {
+    in property <[TrackUi]> video-tracks;
+    in property <[TrackUi]> audio-tracks;
+    in property <[TrackUi]> sub-tracks;
+    callback select-video(int);
+    callback select-audio(int);
+    callback select-sub(int);
+    callback add-subtitle;
+    callback adjust(string, float);
+    callback set-aspect(int);
+    callback set-crop(int);
+    callback set-rotate(int);
+    callback set-hwdec(bool);
+    callback set-deint(bool);
+    callback set-eq-band(int, float);
+    callback set-eq-preset(int);
+    callback set-shaded-bg(bool);
+    callback close;
+
+    property <int> tab: 0;
+    // Fade the shadow with the open state: when closed the drawer sits just off
+    // the window's right edge and its shadow would otherwise bleed a permanent
+    // tint over the (transparent, rounded) right corners.
+    in property <bool> open: true;
+
+    width: 360px;
+    background: #1c1c20f7;
+    border-width: 1px;
+    border-color: #ffffff14;
+
+    // swallow clicks so they don't reach the dismiss backdrop / chrome behind.
+    TouchArea {}
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 4px;
+            DrawerTab { label: "Video"; has-icon: true; icon: @image-url("icons/video-tab.svg"); active: root.tab == 0; clicked => { root.tab = 0; } }
+            DrawerTab { label: "Audio"; has-icon: true; icon: @image-url("icons/volume.svg"); active: root.tab == 1; clicked => { root.tab = 1; } }
+            DrawerTab { label: "Subtitles"; has-icon: true; icon: @image-url("icons/subtitles.svg"); active: root.tab == 2; clicked => { root.tab = 2; } }
+            Rectangle { horizontal-stretch: 1; }
+            IconButton { icon: @image-url("icons/close.svg"); box: 28px; glyph: 15px; clicked => { root.close(); } }
+        }
+        Rectangle { height: 1px; background: #ffffff14; }
+
+        Flickable {
+            vertical-stretch: 1;
+            viewport-height: page.preferred-height;
+            page := VerticalLayout {
+                width: root.width - 24px;
+                spacing: 14px;
+
+                // ===== VIDEO =====
+                if root.tab == 0: VerticalLayout {
+                    spacing: 14px;
+                    GroupCard {
+                        title: "Video track";
+                        TrackRow { label: "None"; clicked => { root.select-video(-1); } }
+                        for t in root.video-tracks: TrackRow { label: t.label; selected: t.selected; clicked => { root.select-video(t.id); } }
+                    }
+                    GroupCard {
+                        title: "Geometry";
+                        ComboRow { title: "Aspect ratio"; options: ["Default", "4:3", "16:9", "16:10", "21:9", "5:4"]; changed(i) => { root.set-aspect(i); } }
+                        ComboRow { title: "Crop"; options: ["None", "4:3", "16:9", "16:10", "21:9", "5:4"]; changed(i) => { root.set-crop(i); } }
+                        ComboRow { title: "Rotation"; options: ["0°", "90°", "180°", "270°"]; changed(i) => { root.set-rotate(i); } }
+                    }
+                    GroupCard {
+                        title: "Speed";
+                        SliderRow { title: "Playback speed"; min: 0.25; max: 16; default-val: 1; unit: "×"; changed(v) => { root.adjust("speed", v); } }
+                    }
+                    GroupCard {
+                        title: "Decoding";
+                        SwitchRow { title: "Hardware decoding"; on: true; toggled(v) => { root.set-hwdec(v); } }
+                        SwitchRow { title: "Deinterlace"; toggled(v) => { root.set-deint(v); } }
+                    }
+                    GroupCard {
+                        title: "Equalizer";
+                        SliderRow { title: "Brightness"; min: -100; max: 100; default-val: 0; decimals: 0; changed(v) => { root.adjust("brightness", v); } }
+                        SliderRow { title: "Contrast"; min: -100; max: 100; default-val: 0; decimals: 0; changed(v) => { root.adjust("contrast", v); } }
+                        SliderRow { title: "Saturation"; min: -100; max: 100; default-val: 0; decimals: 0; changed(v) => { root.adjust("saturation", v); } }
+                        SliderRow { title: "Gamma"; min: -100; max: 100; default-val: 0; decimals: 0; changed(v) => { root.adjust("gamma", v); } }
+                        SliderRow { title: "Hue"; min: -100; max: 100; default-val: 0; decimals: 0; changed(v) => { root.adjust("hue", v); } }
+                    }
+                }
+
+                // ===== AUDIO =====
+                if root.tab == 1: VerticalLayout {
+                    spacing: 14px;
+                    GroupCard {
+                        title: "Audio track";
+                        TrackRow { label: "None"; clicked => { root.select-audio(-1); } }
+                        for t in root.audio-tracks: TrackRow { label: t.label; selected: t.selected; clicked => { root.select-audio(t.id); } }
+                    }
+                    GroupCard {
+                        title: "Audio delay";
+                        SliderRow { title: "Delay (s)"; min: -5; max: 5; default-val: 0; changed(v) => { root.adjust("audio-delay", v); } }
+                    }
+                    GroupCard {
+                        title: "Equalizer";
+                        ComboRow { title: "Preset"; options: ["Flat", "Rock", "Jazz", "Pop", "Bass Boost", "Treble Boost", "Manual"]; current: 6; changed(i) => { root.set-eq-preset(i); } }
+                        SliderRow { title: "32 Hz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(0, v); } }
+                        SliderRow { title: "64 Hz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(1, v); } }
+                        SliderRow { title: "125 Hz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(2, v); } }
+                        SliderRow { title: "250 Hz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(3, v); } }
+                        SliderRow { title: "500 Hz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(4, v); } }
+                        SliderRow { title: "1 kHz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(5, v); } }
+                        SliderRow { title: "2 kHz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(6, v); } }
+                        SliderRow { title: "4 kHz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(7, v); } }
+                        SliderRow { title: "8 kHz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(8, v); } }
+                        SliderRow { title: "16 kHz"; min: -12; max: 12; default-val: 0; decimals: 1; changed(v) => { root.set-eq-band(9, v); } }
+                    }
+                }
+
+                // ===== SUBTITLES =====
+                if root.tab == 2: VerticalLayout {
+                    spacing: 14px;
+                    GroupCard {
+                        title: "Subtitle track";
+                        TrackRow { label: "Off"; clicked => { root.select-sub(-1); } }
+                        for t in root.sub-tracks: TrackRow { label: t.label; selected: t.selected; clicked => { root.select-sub(t.id); } }
+                        // Adwaita-style action row — a full-width Pill looked
+                        // like a giant lozenge wedged into the group card.
+                        Rectangle {
+                            height: 38px;
+                            border-radius: 9px;
+                            background: addta.has-hover ? #ffffff14 : transparent;
+                            animate background { duration: 100ms; }
+                            HorizontalLayout {
+                                padding-left: 12px; padding-right: 12px; spacing: 8px;
+                                Text { text: "+"; color: #4593f0; font-size: 16px; font-weight: 700; width: 16px; vertical-alignment: center; }
+                                Text { text: "Add subtitle file…"; color: #ffffffd1; font-size: 14px; vertical-alignment: center; }
+                            }
+                            addta := TouchArea { clicked => { root.add-subtitle(); } }
+                        }
+                    }
+                    GroupCard {
+                        title: "Timing & position";
+                        SliderRow { title: "Delay (s)"; min: -10; max: 10; default-val: 0; decimals: 1; changed(v) => { root.adjust("sub-delay", v); } }
+                        SliderRow { title: "Position"; min: 0; max: 150; default-val: 100; decimals: 0; changed(v) => { root.adjust("sub-pos", v); } }
+                        SliderRow { title: "Scale"; min: 0.5; max: 3; default-val: 1; changed(v) => { root.adjust("sub-scale", v); } }
+                    }
+                    GroupCard {
+                        title: "Text style";
+                        SliderRow { title: "Outline width"; min: 0; max: 6; default-val: 3; decimals: 1; changed(v) => { root.adjust("sub-border-size", v); } }
+                        SwitchRow { title: "Shaded background"; toggled(v) => { root.set-shaded-bg(v); } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- URL input dialog ----------
+// A styled text field used for the URL (multi-line, char-wrap) and the optional
+// username/password (single-line). Slint's clipboard is dead on this backend, so
+// Ctrl+V is intercepted and routed through `read-clipboard` (Rust reads the OS
+// clipboard and returns it). Multi-line + char-wrap avoids the horizontal
+// scroll-to-cursor that blinked / hid long URLs.
+component TextField inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> password;
+    in property <bool> multiline;
+    out property <string> text: ti.text;
+    callback submit;
+    callback cancel;
+    callback read-clipboard() -> string;
+    callback write-clipboard(string);
+
+    min-width: 0px;
+    min-height: 40px;
+    background: #00000059;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: ti.has-focus ? #4593f0 : #ffffff2e;
+
+    public function focus-input() { ti.focus(); }
+
+    ContextMenuArea {
+        Menu {
+            MenuItem { title: "Paste"; activated => { ti.text = root.read-clipboard(); ti.set-selection-offsets(0, 0); } }
+            MenuItem { title: "Copy"; activated => { root.write-clipboard(ti.text); } }
+            MenuItem { title: "Cut"; activated => { root.write-clipboard(ti.text); ti.text = ""; } }
+            MenuItem { title: "Select all"; activated => { ti.select-all(); } }
+        }
+        VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 9px;
+            padding-bottom: 9px;
+            ti := TextInput {
+            min-width: 0px;
+            horizontal-stretch: 1;
+            color: #ffffff;
+            font-size: 14px;
+            single-line: !root.multiline;
+            wrap: root.multiline ? TextWrap.char-wrap : TextWrap.no-wrap;
+            input-type: root.password ? InputType.password : InputType.text;
+            // Intercept Ctrl+V (paste via Rust). Return submits, Escape cancels.
+            // Everything else `reject`s so normal editing runs and keystrokes
+            // don't leak to the global player shortcuts.
+            key-pressed(e) => {
+                if (e.modifiers.control && (e.text == "v" || e.text == "V")) {
+                    ti.text = root.read-clipboard();
+                    ti.set-selection-offsets(0, 0);
+                    return accept;
+                }
+                // Shift+Enter adds a newline (a multiline field can hold several
+                // links, one per line); plain Enter submits.
+                if (e.text == Key.Return) {
+                    if (root.multiline && e.modifiers.shift) { return reject; }
+                    root.submit();
+                    return accept;
+                }
+                if (e.text == Key.Escape) { root.cancel(); return accept; }
+                return reject;
+            }
+            }
+        }
+    }
+    if ti.text == "": Text {
+        x: 12px;
+        y: 9px;
+        text: root.placeholder;
+        color: #ffffff59;
+        font-size: 14px;
+    }
+}
+
+component UrlDialog inherits Rectangle {
+    // The pending links are a Rust-managed model so the dialog can show them as a
+    // VIRTUALIZED list (only visible rows render) — a single big TextInput holding
+    // all the links re-lays-out the whole text on every keystroke and lagged hard.
+    in property <[string]> url-list;
+    in-out property <bool> rejected;    // last add wasn't a valid link/file
+    callback add-urls(string);          // paste/type → split + add to the list
+    callback request-paste();           // async: read clipboard off-thread → add
+    callback remove-url(int);
+    callback submit(string, string);    // username, password — loads the list
+    callback cancel;
+    callback read-clipboard() -> string;
+    callback write-clipboard(string);
+    background: #000000b8.transparentize(1 - root.f);
+
+    // Entrance animation: fade the backdrop + slide/rise the card. `init` bumps
+    // f 0→1 once on creation (per-leaf alpha — element opacity corrupts here).
+    property <float> f;
+    init => { root.f = 1; root.rejected = false; }
+    animate f { duration: 170ms; easing: ease-out; }
+
+    function add-typed() {
+        if (in-field.text != "") {
+            root.add-urls(in-field.text);
+            // Keep the text if it was rejected, so the user can fix it in place.
+            if (!root.rejected) { in-field.text = ""; }
+        }
+    }
+
+    // backdrop: click outside the card to dismiss
+    TouchArea { clicked => { root.cancel(); } }
+
+    Rectangle {
+        width: 520px;
+        height: body.preferred-height;
+        // centred, with a small rise as it fades in
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 + 16px * (1 - root.f);
+        background: #1c1c22;
+        border-radius: 16px;
+        border-width: 1px;
+        border-color: #ffffff24;
+        // swallow clicks so they don't reach the backdrop
+        TouchArea {}
+
+        body := VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "Open URL or stream"; color: #ffffff; font-size: 16px; font-weight: 700; }
+                Text {
+                    text: "Paste link(s), or type one and press Enter.";
+                    color: #ffffff8c; font-size: 12.5px;
+                }
+            }
+
+            // Single-line adder — fast (no large-text layout). Paste adds every
+            // line straight to the list; Enter adds the typed link.
+            Rectangle {
+                min-width: 0px;
+                height: 44px;
+                background: #00000059;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: root.rejected ? #f0594e : (in-field.has-focus ? #4593f0 : #ffffff2e);
+                // Right-click menu (Slint's native clipboard is dead here, so each
+                // item routes through our Rust read/write-clipboard).
+                ContextMenuArea {
+                    Menu {
+                        MenuItem { title: "Paste"; activated => { root.request-paste(); } }
+                        MenuItem { title: "Copy"; activated => { root.write-clipboard(in-field.text); } }
+                        MenuItem { title: "Cut"; activated => { root.write-clipboard(in-field.text); in-field.text = ""; } }
+                        MenuItem { title: "Select all"; activated => { in-field.select-all(); } }
+                    }
+                    HorizontalLayout {
+                        padding-left: 12px; padding-right: 12px;
+                        in-field := TextInput {
+                            min-width: 0px;
+                            horizontal-stretch: 1;
+                            color: #ffffff;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            single-line: true;
+                            edited => { root.rejected = false; }
+                            key-pressed(e) => {
+                                if (e.modifiers.control && (e.text == "v" || e.text == "V")) {
+                                    root.request-paste();
+                                    return accept;
+                                }
+                                if (e.text == Key.Return) { root.add-typed(); return accept; }
+                                if (e.text == Key.Escape) { root.cancel(); return accept; }
+                                return reject;
+                            }
+                        }
+                    }
+                }
+                if in-field.text == "": Text {
+                    x: 12px; height: 100%; vertical-alignment: center;
+                    text: "Paste or type a link, then Enter";
+                    color: #ffffff59; font-size: 14px;
+                }
+            }
+
+            // Inline hint when the last entry wasn't a real link/file.
+            if root.rejected: Text {
+                text: "The link you entered is invalid. Please enter a valid URL.";
+                color: #f0594e; font-size: 12px;
+            }
+
+            // Pending links — a virtualized list (only the visible rows exist).
+            if root.url-list.length > 0: Text {
+                text: root.url-list.length + (root.url-list.length == 1 ? " link" : " links");
+                color: #ffffff80; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+            }
+            if root.url-list.length > 0: Rectangle {
+                height: 160px;
+                background: #00000033;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: #ffffff14;
+                ListView {
+                    x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+                    for url[i] in root.url-list: Rectangle {
+                        height: 34px;
+                        border-radius: 7px;
+                        background: rowa.has-hover ? #ffffff0d : transparent;
+                        rowa := TouchArea { }
+                        HorizontalLayout {
+                            padding-left: 10px; padding-right: 6px; spacing: 8px;
+                            Text {
+                                text: url;
+                                color: #ffffffce; font-size: 13px;
+                                vertical-alignment: center; overflow: elide; horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: 26px;
+                                Rectangle {
+                                    width: 24px; height: 24px; border-radius: 12px;
+                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                    background: xa.has-hover ? #e8433ed9 : transparent;
+                                    Text { text: "✕"; color: xa.has-hover ? #ffffff : #ffffff73; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                    xa := TouchArea { clicked => { root.remove-url(i); } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                user-field := TextField {
+                    horizontal-stretch: 1;
+                    placeholder: "Username (optional)";
+                    submit => { root.submit(user-field.text, pass-field.text); }
+                    cancel => { root.cancel(); }
+                    read-clipboard() => { return root.read-clipboard(); }
+                }
+                pass-field := TextField {
+                    horizontal-stretch: 1;
+                    password: true;
+                    placeholder: "Password (optional)";
+                    submit => { root.submit(user-field.text, pass-field.text); }
+                    cancel => { root.cancel(); }
+                    read-clipboard() => { return root.read-clipboard(); }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                Rectangle { horizontal-stretch: 1; }
+                Pill { label: "Cancel"; pad: 20px; clicked => { root.cancel(); } }
+                Pill {
+                    label: "Open"; primary: true; pad: 20px;
+                    clicked => { root.add-typed(); root.submit(user-field.text, pass-field.text); }
+                }
+            }
+        }
+        focus-timer := Timer {
+            interval: 1ms;
+            running: true;
+            triggered => { in-field.focus(); focus-timer.running = false; }
+        }
+    }
+}
+
+// ---------- home / welcome screen ----------
+component RecentRow inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> is-stream;
+    callback play;
+    callback remove;
+    height: 50px;
+    border-radius: 9px;
+    background: ta.has-hover ? #ffffff14 : transparent;
+    animate background { duration: 100ms; }
+    ta := TouchArea { clicked => { root.play(); } }
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 6px; spacing: 12px;
+        // film / link icon (GTK: video-x-generic / insert-link)
+        Rectangle {
+            width: 18px;
+            Image {
+                width: 18px; height: 18px;
+                image-fit: contain;
+                source: root.is-stream ? @image-url("icons/link.svg") : @image-url("icons/video-tab.svg");
+                opacity: 0.55;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 1px;
+            Text { text: root.title; color: #ffffffeb; font-size: 14px; font-weight: 500; overflow: elide; }
+            if root.subtitle != "": Text { text: root.subtitle; color: #ffffff73; font-size: 12px; overflow: elide; }
+        }
+        // remove (X) — always visible like GTK; hover turns it red
+        Rectangle {
+            width: 30px; height: 30px; y: (parent.height - 30px) / 2;
+            border-radius: 15px;
+            background: xa.has-hover ? #e8433ed9 : transparent;
+            animate background { duration: 100ms; }
+            Text {
+                text: "✕";
+                color: xa.has-hover ? #ffffff : #ffffff66;
+                font-size: 13px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            xa := TouchArea { clicked => { root.remove(); } }
+        }
+    }
+}
+
+component Home inherits Rectangle {
+    in property <[RecentUi]> recents;
+    callback open-file;
+    callback open-url;
+    callback play-recent(string);
+    callback remove-recent(string);
+    callback clear-recents;
+    callback drag;
+    background: #0a0a0c;
+
+    // Drag the frameless window from any empty area of the home screen (the
+    // buttons / recents rows are later children, so they stay clickable).
+    TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.drag();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 56px;
+
+        // branding column
+        VerticalLayout {
+            spacing: 18px;
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout { alignment: center;
+                logo := Rectangle {
+                    width: 84px;
+                    height: 116px;
+                    property <float> phase: Math.mod(animation-tick() / 1ms, 3800) / 3800;
+                    property <float> t: phase / 0.55;
+                    // Band centre along the top-left -> bottom-right diagonal
+                    // (0..1), matching the GTK ShineLogo sweep; parked
+                    // off-glyph during the idle pause.
+                    property <float> center: phase < 0.55 ? -0.25 + (t * t * (3 - 2 * t)) * 1.5 : 2.0;
+                    property <string> glyph: "M790.4 413.34q-14.65 56.1-61.31 89.27-35.96 24.53-79.59 25.36-12.28 0.23-27.5 0.16c-53-0.22-92.06 43.04-89.62 94.89 0.76 16.12 6.68 33.49 14.54 48.29q0.06 0.11 0.04 0.23-0.01 0.11-0.1 0.2-0.09 0.09-0.2 0.1-0.12 0.02-0.23-0.04c-14.8-7.72-29.02-17.38-40.98-29.39-38.52-38.66-54.67-95.25-38.97-148.55 13-44.13 45.45-80.55 88.1-98.04q30.17-12.38 64.18-12.64 25.81-0.2 155.69-0.09c12.13 0.01 19.13 10.22 17.29 21.43q-0.75 4.53-1.34 8.82zM621.37 581.38q0.02-0.07 0.06-0.13 0.05-0.06 0.11-0.09 0.07-0.03 0.14-0.03 0.07 0 0.14 0.03 37.97 17.66 83.72 38.55c12.14 5.55 22.18 9.91 31.83 16.58 22.58 15.6 38.8 39.44 44.64 66.43q7.05 32.59-3.62 63.71-11.44 33.34-37.96 56.58c-25.92 22.71-58.56 34.11-92.93 34.28q-22.19 0.12-161.42 0.14-7.53 0-10.28-0.88c-6.45-2.07-10.54-7.69-11.4-14.58q-0.37-3.06 0.96-8.88c5.78-25.18 21.06-49.75 39.35-67.88 29.61-29.33 66.29-46.47 105.74-58.46q15.27-4.64 20.93-7.81c24.52-13.69 36.3-39.03 25.26-66.05-1.72-4.2-4.35-7.72-7.07-11.61q-14.33-20.47-28.19-39.73-0.01-0.01-0.01-0.02-0.01-0.01-0.01-0.03 0-0.01 0-0.03 0-0.01 0-0.03 0.01-0.04 0.01-0.06z";
+
+                    // Base glyph as a Path (not the SVG Image) so the shine
+                    // overlay below shares the exact same scaling/alignment.
+                    Path {
+                        width: 100%; height: 100%;
+                        viewbox-x: 460.525; viewbox-y: 383.051;
+                        viewbox-width: 331.506; viewbox-height: 474.379;
+                        commands: logo.glyph;
+                        fill: #ede9e4;
+                    }
+                    // Shine: the same glyph filled with a soft diagonal
+                    // gradient band — gradient masked to shape, exactly the
+                    // GTK ShineLogo mechanism. Slint can't animate gradient
+                    // stop positions (they silently render as nothing), so the
+                    // stops are CONSTANT and the whole Path element sweeps
+                    // diagonally instead, its viewbox counter-shifted so the
+                    // glyph stays put while the band (anchored to the element
+                    // bounds) travels across it. No clips, no layers.
+                    Path {
+                        x: (logo.center - 0.5) * logo.width;
+                        y: (logo.center - 0.5) * logo.height;
+                        width: logo.width; height: logo.height;
+                        viewbox-x: 460.525 + (self.x / logo.width) * 331.506;
+                        viewbox-y: 383.051 + (self.y / logo.height) * 474.379;
+                        viewbox-width: 331.506; viewbox-height: 474.379;
+                        commands: logo.glyph;
+                        // hw = 0.14 of the diagonal, like GTK's band_stops.
+                        // NB exactly three stops: padding the gradient with
+                        // duplicate transparent stops at 0%/100% makes the
+                        // whole Path fill render as nothing on this stack.
+                        fill: @linear-gradient(144deg,
+                            #ffffff00 36%,
+                            #ffffff99 50%,
+                            #ffffff00 64%);
+                    }
+                }
+            }
+            HorizontalLayout { alignment: center;
+                Text { text: "Soniq"; color: #fffffff2; font-size: 32px; font-weight: 800; }
+            }
+            HorizontalLayout { alignment: center;
+                Text {
+                    text: "Drop a video here, open a file, or paste a URL";
+                    color: #ffffff8c; font-size: 14px;
+                    horizontal-alignment: center; wrap: word-wrap; width: 240px;
+                }
+            }
+            HorizontalLayout {
+                alignment: center; spacing: 10px;
+                Pill { label: "Open File"; primary: true; height: 36px; pad: 22px; clicked => { root.open-file(); } }
+                Pill { label: "Open URL"; height: 36px; pad: 22px; clicked => { root.open-url(); } }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // recents column (only when present)
+        if root.recents.length > 0: VerticalLayout {
+            alignment: center;
+            width: 400px;
+            spacing: 8px;
+            HorizontalLayout {
+                Text { text: "Recently played"; color: #ffffff8c; font-size: 13px; font-weight: 600; horizontal-stretch: 1; vertical-alignment: center; }
+                // Flat text button like GTK's, not a pill.
+                Rectangle {
+                    width: cltxt.preferred-width + 20px;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: clta.has-hover ? #ffffff14 : transparent;
+                    animate background { duration: 100ms; }
+                    cltxt := Text {
+                        text: "Clear";
+                        color: clta.has-hover ? #fffffff2 : #ffffffa6;
+                        font-size: 13px; font-weight: 600;
+                        horizontal-alignment: center; vertical-alignment: center;
+                        width: 100%; height: 100%;
+                    }
+                    clta := TouchArea { clicked => { root.clear-recents(); } }
+                }
+            }
+            Rectangle {
+                background: #ffffff08;
+                border-radius: 14px;
+                border-width: 1px;
+                border-color: #ffffff14;
+                VerticalLayout {
+                    padding: 4px;
+                    // Cap like GTK's scrolled window (max 360px) — long
+                    // histories scroll instead of growing past the window.
+                    Flickable {
+                        height: Math.min(rows.preferred-height, 352px);
+                        viewport-height: rows.preferred-height;
+                        rows := VerticalLayout {
+                            spacing: 2px;
+                            for r in root.recents: RecentRow {
+                                title: r.title;
+                                subtitle: r.subtitle;
+                                is-stream: r.is-stream;
+                                play => { root.play-recent(r.path); }
+                                remove => { root.remove-recent(r.path); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- root window ----------
+export component App inherits Window {
+    in property <bool> has-video: false;
+    // Gates the video layer until mpv has settled at native size and produced a
+    // clean frame, so the noisy nvdec-init / resize churn on load stays hidden
+    // behind the black background.
+    in property <bool> video-ready: false;
+    // Native video pixel size (set from Rust) — used to compute the video's
+    // exact display rect for the contain fit.
+    in property <float> video-w: 16;
+    in property <float> video-h: 9;
+    in property <image> video-frame;
+    in property <string> title-text;
+    in property <string> position-text: "0:00";
+    in property <string> duration-text: "0:00";
+    in property <float> duration-secs;
+    in property <float> progress;
+    in property <float> buffered;
+    in property <float> volume: 1.0;
+    in property <bool> paused;
+    in property <bool> muted;
+    in property <bool> chrome-shown: true;
+    // Animated chrome alpha. The leaves of the top/control bars bind to this
+    // directly (colour alpha / image opacity) instead of an `opacity` on the
+    // bars themselves: element-opacity over children renders via a Skia
+    // layer, and layers half-update on this stack (bars appeared in halves
+    // while fading).
+    property <float> chrome-fade: root.chrome-shown ? 1.0 : 0.0;
+    animate chrome-fade { duration: 220ms; }
+    in property <bool> buffering: false;
+    in property <float> speed: 1.0;
+    in property <[TrackUi]> video-tracks;
+    in property <[TrackUi]> audio-tracks;
+    in property <[TrackUi]> sub-tracks;
+    in property <[RecentUi]> recents;
+    in property <[QueueItem]> queue;
+    in-out property <bool> drawer-open: false;
+    in-out property <bool> queue-open: false;
+    callback play-queue-index(int);
+    in-out property <bool> url-open: false;
+    in-out property <bool> resume-open: false;
+    in property <string> resume-text;
+    in property <string> osd-text;
+    in property <bool> osd-shown: false;
+
+    callback toggle-pause;
+    callback seek(float);
+    callback seek-commit(float);
+    callback seek-by(float);
+    callback set-volume(float);
+    callback nudge-volume(float);
+    callback toggle-mute;
+    callback prev;
+    callback next;
+    callback stop;
+    callback subtitles;
+    callback fullscreen;
+    callback open-file;
+    callback open-url;
+    // A file handed in from another launch (single-instance handoff, see ipc.rs).
+    callback external-open(string);
+    // Pending URLs in the Open-URL dialog (a Rust-managed model, virtualized).
+    in property <[string]> url-list;
+    // Set by Rust when an add was rejected (not a link/file) — drives an inline hint.
+    in-out property <bool> url-rejected;
+    callback url-add(string);          // split newlines, append to the list
+    callback request-paste();          // async clipboard read → url-add (off UI thread)
+    callback url-remove(int);
+    callback url-clear;                // drop all pending (on cancel)
+    // username, password (optional — injected into each link); loads the list.
+    callback submit-urls(string, string);
+    // Read the OS clipboard (Rust side) — Slint's own clipboard doesn't work on
+    // this winit-0.30 Wayland backend; returned to the field's Ctrl+V handler.
+    callback read-clipboard() -> string;
+    callback write-clipboard(string);
+    callback minimize;
+    callback maximize;
+    callback close-window;
+    callback pointer-activity;
+    // Re-apply the winit min size when the home↔video state flips (Slint's own
+    // min-width isn't enforced by the compositor on this frameless window).
+    callback apply-min-size;
+    changed has-video => { root.apply-min-size(); }
+    callback select-video(int);
+    callback select-audio(int);
+    callback select-sub(int);
+    callback add-subtitle;
+    callback adjust(string, float);
+    callback set-aspect(int);
+    callback set-crop(int);
+    callback set-rotate(int);
+    callback set-hwdec(bool);
+    callback set-deint(bool);
+    callback set-eq-band(int, float);
+    callback set-eq-preset(int);
+    callback set-shaded-bg(bool);
+    callback reset-all;
+    callback open-prefs;
+    callback play-recent(string);
+    callback remove-recent(string);
+    callback clear-recents;
+    // The bool is the "Always resume" opt-in from the banner's checkbox.
+    callback resume-accept(bool);
+    callback resume-dismiss;
+    callback escape-pressed;
+    callback key-event(string);
+    callback video-clicked;
+    callback video-double-clicked;
+    callback video-right-clicked;
+
+    property <length> bar-off-x: 0;
+    property <length> bar-off-y: 0;
+
+    // When the URL dialog closes (any path: Cancel, Escape, backdrop, Open, or
+    // programmatic), keyboard focus is left orphaned on the destroyed LineEdit —
+    // restore it to the global key scope so shortcuts keep working.
+    changed url-open => {
+        if (!root.url-open) { keys.focus(); }
+    }
+
+    title: "Soniq";
+    preferred-width: 960px;
+    preferred-height: 560px;
+    // The home is a landscape layout (branding + recents) and needs room; a
+    // playing video may be portrait (reels) and must be allowed to go narrow.
+    // So the floor depends on what's showing.
+    min-width: root.has-video ? 426px : 880px;
+    min-height: root.has-video ? 240px : 540px;
+    // Client-side decorated, like the GTK build: no system title bar / border.
+    // NB: opaque + square corners on purpose — rounded corners need an alpha
+    // surface and a clipped layer, and on this stack the GL surface has no
+    // working alpha (corners render black) and clip breaks descendant
+    // drop-shadows (they paint as solid black boxes).
+    no-frame: true;
+    // Always clear opaque black — corner transparency is carved into the alpha
+    // channel by punch_window_corners() AFTER Skia renders. Clearing with
+    // `transparent` made Skia composite the fading panels over an alpha-0
+    // background (premultiply bug → RGB flashes = "screen blinks on fades",
+    // invisible in opaque mode only because the same math landed on black).
+    in property <bool> alpha-surface: false;
+    background: #000000;
+    forward-focus: keys;
+
+    // Squared corners when fullscreen / maximized (set from Rust).
+    in property <bool> win-square: false;
+    // Frameless window move / resize, forwarded to winit.
+    callback start-move;
+    callback start-resize(string);
+
+    frame := Rectangle {
+        background: #000000;
+        // Rounded *directly* — no `clip: true` here: clipped layers on this
+        // stack composite alpha as solid black (the black shadow-boxes bug).
+        // Edge-touching children are rounded individually instead.
+        border-radius: (root.alpha-surface && !root.win-square) ? 12px : 0px;
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) { root.escape-pressed(); return accept; }
+            // All bindings are data-driven: forward the normalised key to Rust,
+            // which looks it up in the (user-editable) shortcut map.
+            root.key-event(KeyName.of(e.text, e.modifiers.control, e.modifiers.alt, e.modifiers.shift));
+            return accept;
+        }
+
+        // video layer. NOT clipped (clip layers composite alpha as opaque black
+        // on this stack), and sized to EXACTLY the video's display rect — a
+        // borrowed-texture Image paints its full bounds opaquely (letterbox
+        // bands become alpha-255 black, killing the rounded corners), so the
+        // contain fit is computed here instead of using `image-fit: contain`
+        // on a full-window element. When the video exactly fills the window,
+        // its corners are erased in the FBO itself (erase_corners in video.rs).
+        Image {
+            visible: root.has-video && root.video-ready;
+            property <float> fit: Math.min(
+                parent.width / 1px / Math.max(root.video-w, 1),
+                parent.height / 1px / Math.max(root.video-h, 1));
+            width: root.video-w * self.fit * 1px;
+            height: root.video-h * self.fit * 1px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            image-fit: fill;
+            source: root.video-frame;
+        }
+
+        // home / welcome
+        Home {
+            visible: !root.has-video;
+            width: 100%; height: 100%;
+            border-radius: (root.alpha-surface && !root.win-square) ? 12px : 0px;
+            recents: root.recents;
+            open-file => { root.open-file(); }
+            open-url => { root.open-url(); }
+            play-recent(p) => { root.play-recent(p); }
+            remove-recent(p) => { root.remove-recent(p); }
+            clear-recents => { root.clear-recents(); }
+            drag => { root.start-move(); }
+        }
+
+        // pointer tracking + click-to-toggle over the video.
+        // NB: TouchArea.moved only fires while pressed, so hover reveal uses the
+        // mouse-x/mouse-y changed handlers instead.
+        vid-ta := TouchArea {
+            visible: root.has-video;
+            width: 100%; height: 100%;
+            // start-move may only fire ONCE per press: every moved event past
+            // the threshold re-calling drag_window() spams compositor re-grabs
+            // and makes the screen blink during the drag.
+            property <bool> move-started: false;
+            changed mouse-x => { root.pointer-activity(); }
+            changed mouse-y => { root.pointer-activity(); }
+            // Wheel over the video adjusts volume (GTK parity): 5% per notch
+            // (one notch = 60px in Slint's winit backend), proportional for
+            // touchpad pixel deltas. Up = louder. The nudge handler clamps
+            // and shows the volume OSD.
+            scroll-event(e) => {
+                root.nudge-volume(e.delta-y / 60px * 0.05);
+                accept
+            }
+            // With the settings drawer open, a click on the video dismisses it
+            // (instead of running the single-click action).
+            clicked => {
+                if (root.drawer-open) {
+                    root.drawer-open = false;
+                } else {
+                    root.video-clicked();
+                }
+            }
+            double-clicked => { root.video-double-clicked(); }
+            // GTK-style: press-and-drag anywhere on the video moves the window.
+            // The threshold keeps plain clicks working; once the compositor
+            // takes the grab, the synthetic far-outside release prevents this
+            // press from also registering as a click.
+            // 14px: a real mouse click wiggles a few px — a low threshold made
+            // ~2/3 of clicks accidentally start a compositor move-grab (a
+            // visible flash + swallowed click).
+            moved => {
+                if (self.pressed && !self.move-started
+                    && (Math.abs(self.mouse-x - self.pressed-x) > 14px
+                        || Math.abs(self.mouse-y - self.pressed-y) > 14px)) {
+                    self.move-started = true;
+                    root.start-move();
+                }
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    self.move-started = false;
+                    if (e.button == PointerEventButton.right) {
+                        // Configurable right-click action (default Play / Pause).
+                        root.video-right-clicked();
+                    }
+                }
+            }
+        }
+
+        // loading spinner — shown the moment a file is opened (view switches
+        // instantly), until the first clean frame is ready (video-ready).
+        if root.has-video && !root.video-ready: Image {
+            width: 42px;
+            height: 42px;
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            source: @image-url("icons/spinner.svg");
+            transform-rotation: (animation-tick() / 1ms) * 0.42deg;
+            opacity: 0.9;
+        }
+
+        // buffering chip
+        if root.buffering && root.has-video: Rectangle {
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            width: 150px;
+            height: 44px;
+            background: #14141699;
+            border-radius: 22px;
+            border-width: 1px;
+            border-color: #ffffff14;
+            Text {
+                text: "Buffering…";
+                color: #ffffffeb;
+                font-size: 14px;
+                opacity: 0.55 + 0.45 * Math.sin((animation-tick() / 1ms) * 0.6deg);
+            }
+        }
+
+        // OSD toast (top-centre)
+        Rectangle {
+            x: (root.width - self.width) / 2;
+            // subtle rise as it fades in
+            y: 70px + 7px * (1 - self.fade);
+            width: txt.preferred-width + 32px;
+            height: 36px;
+            // Per-leaf fade (no element opacity — Skia layers half-update
+            // on this stack; see chrome-fade).
+            property <float> fade: root.osd-shown ? 1.0 : 0.0;
+            animate fade { duration: 200ms; easing: ease-out; }
+            background: #141416e0.transparentize(1 - self.fade);
+            border-radius: 18px;
+            border-width: 1px;
+            border-color: #ffffff1a.transparentize(1 - self.fade);
+            txt := Text {
+                text: root.osd-text;
+                color: #ffffff.transparentize(1 - parent.fade);
+                font-size: 14px;
+                font-weight: 600;
+            }
+        }
+
+        // resume banner (top-centre)
+        if root.resume-open: rbanner := Rectangle {
+            // "Always resume" opt-in — resets each time the banner reappears
+            // (the `if` recreates this subtree).
+            property <bool> always: false;
+            // entrance: slide down into place (init bumps f 0→1 on creation)
+            property <float> f;
+            init => { rbanner.f = 1; }
+            animate f { duration: 180ms; easing: ease-out; }
+            x: (root.width - self.width) / 2;
+            y: 64px - 12px * (1 - rbanner.f);
+            // row.preferred-width already includes the row's own padding —
+            // adding extra here stretched the pill/text to absorb the slack.
+            width: row.preferred-width;
+            height: 52px;
+            background: #141416f0;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #ffffff1a;
+            row := HorizontalLayout {
+                padding-left: 16px; padding-right: 10px; spacing: 16px;
+                // 9px top/bottom = (52 - 34) / 2: gives every child the same
+                // 34px lane so the fixed-height Pill, the text and the close
+                // button all sit on one centred line.
+                padding-top: 9px; padding-bottom: 9px;
+                // Match the GTK banner label: medium weight, near-white — the
+                // default-weight text looked thin/odd next to the bold button.
+                Text { text: root.resume-text; color: #fffffff2; font-size: 15px; font-weight: 500; vertical-alignment: center; }
+                // "Always resume" checkbox, like the GTK banner.
+                Rectangle {
+                    width: cl.preferred-width;
+                    TouchArea { clicked => { rbanner.always = !rbanner.always; } }
+                    cl := HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            width: 18px;
+                            Rectangle {
+                                width: 18px; height: 18px;
+                                border-radius: 4px;
+                                border-width: rbanner.always ? 0px : 1.5px;
+                                border-color: #ffffff73;
+                                background: rbanner.always ? #3584e4 : transparent;
+                                animate background { duration: 100ms; }
+                                Text { text: "✓"; visible: rbanner.always; color: #ffffff; font-size: 12px; font-weight: 700; }
+                            }
+                        }
+                        Text { text: "Always resume"; color: #ffffffd9; font-size: 14px; vertical-alignment: center; }
+                    }
+                }
+                Pill { label: "Resume"; primary: true; clicked => { root.resume-accept(rbanner.always); } }
+                IconButton { icon: @image-url("icons/close.svg"); box: 28px; glyph: 14px; clicked => { root.resume-dismiss(); } }
+            }
+        }
+
+        // chrome (auto-hides)
+        // Legibility fade behind the top chrome: one smooth slope, taller
+        // than the bar so it ends in nothing (a slope kink Mach-bands and a
+        // hard stop reads as a band edge). Non-interactive.
+        if root.has-video: Rectangle {
+            x: 0; y: 0; width: 100%; height: 96px;
+            background: @linear-gradient(180deg, #00000059 0%, #00000000 100%);
+            // Leaf element (no children): plain opacity doesn't layerize.
+            opacity: root.chrome-fade;
+        }
+        TopBar {
+            // Always shown: on the frameless Linux window this bar is the only
+            // place to minimize/maximize/close and reach settings, so the home
+            // screen needs it too (over video it fades with the rest of the
+            // chrome). The legibility gradient above stays video-only — the home
+            // background is already solid dark.
+            x: 0; y: 0; width: 100%;
+            // NB: no background of its own — the fade above provides the
+            // legibility shade.
+            // native decorations (macOS) provide their own window buttons
+            window-controls: root.alpha-surface;
+            title-text: root.title-text;
+            fade: root.chrome-fade;
+            open-file => { root.open-file(); }
+            open-url => { root.open-url(); }
+            settings => { root.open-prefs(); }
+            minimize => { root.minimize(); }
+            maximize => { root.maximize(); }
+            close => { root.close-window(); }
+            drag => { root.start-move(); }
+        }
+
+        bar := ControlBar {
+            visible: root.has-video;
+            width: Math.min(root.width - 32px, 720px);
+            // Clamp the drag offset in the binding (not just while dragging):
+            // a bar dragged near an edge in fullscreen would otherwise sit
+            // outside the window after it shrinks back.
+            x: (root.width - self.width) / 2 + Math.clamp(root.bar-off-x,
+                -((root.width - self.width) / 2 - 8px),
+                 ((root.width - self.width) / 2 - 8px));
+            y: root.height - self.height - 8px + Math.clamp(root.bar-off-y,
+                -(root.height - self.height - 16px), 0);
+            fade: root.chrome-fade;
+            hovered => { root.pointer-activity(); }
+            moved-by(dx, dy) => {
+                root.pointer-activity();
+                root.bar-off-x = Math.clamp(root.bar-off-x + dx,
+                    -((root.width - self.width) / 2 - 8px),
+                     ((root.width - self.width) / 2 - 8px));
+                root.bar-off-y = Math.clamp(root.bar-off-y + dy,
+                    -(root.height - self.height - 16px), 0);
+            }
+            paused: root.paused;
+            muted: root.muted;
+            progress: root.progress;
+            buffered: root.buffered;
+            duration-secs: root.duration-secs;
+            volume: root.volume;
+            position-text: root.position-text;
+            duration-text: root.duration-text;
+            toggle-pause => { root.toggle-pause(); }
+            seek(v) => { root.seek(v); root.pointer-activity(); }
+            seek-commit(v) => { root.seek-commit(v); root.pointer-activity(); }
+            set-volume(v) => { root.set-volume(v); root.pointer-activity(); }
+            toggle-mute => { root.toggle-mute(); }
+            prev => { root.prev(); }
+            next => { root.next(); }
+            stop => { root.stop(); }
+            subtitles => { root.drawer-open = true; root.queue-open = false; }
+            settings => { root.drawer-open = !root.drawer-open; root.queue-open = false; }
+            playlist => { root.queue-open = !root.queue-open; root.drawer-open = false; }
+            fullscreen => { root.fullscreen(); }
+        }
+
+        // Dismiss backdrop for the side panels: while the drawer or playlist is
+        // open it covers the whole window BELOW the panels — so clicks meant for
+        // the chrome (window buttons, control bar) are blocked, and a click off
+        // the panel (e.g. on the video) closes it. Sits above the chrome, below
+        // the panels (which swallow their own clicks).
+        if root.drawer-open || root.queue-open: TouchArea {
+            x: 0; y: 0; width: 100%; height: 100%;
+            clicked => { root.drawer-open = false; root.queue-open = false; }
+        }
+
+        // settings drawer (slides from the right)
+        Drawer {
+            // Animate a 0↔1 slide factor, NOT x itself: x depends on the window
+            // width, so animating x makes the closed drawer visibly slide
+            // through the window whenever a resize changes root.width.
+            // The +4px parks the closed drawer safely past the edge: at exactly
+            // x = width, fractional display scaling can round its first column
+            // onto the last visible pixel (a full-height sliver at the edge).
+            property <float> slide: root.drawer-open ? 1.0 : 0.0;
+            animate slide { duration: 250ms; easing: ease-out; }
+            x: root.width - self.width * self.slide + 4px * (1 - self.slide);
+            y: 0;
+            height: root.height;
+            open: root.drawer-open;
+            video-tracks: root.video-tracks;
+            audio-tracks: root.audio-tracks;
+            sub-tracks: root.sub-tracks;
+            select-video(i) => { root.select-video(i); }
+            select-audio(i) => { root.select-audio(i); }
+            select-sub(i) => { root.select-sub(i); }
+            add-subtitle => { root.add-subtitle(); }
+            adjust(k, v) => { root.adjust(k, v); }
+            set-aspect(i) => { root.set-aspect(i); }
+            set-crop(i) => { root.set-crop(i); }
+            set-rotate(i) => { root.set-rotate(i); }
+            set-hwdec(v) => { root.set-hwdec(v); }
+            set-deint(v) => { root.set-deint(v); }
+            set-eq-band(i, v) => { root.set-eq-band(i, v); }
+            set-eq-preset(i) => { root.set-eq-preset(i); }
+            set-shaded-bg(v) => { root.set-shaded-bg(v); }
+            close => { root.drawer-open = false; }
+        }
+
+        // playback queue panel (slides from the right, same mechanism as Drawer)
+        QueuePanel {
+            property <float> slide: root.queue-open ? 1.0 : 0.0;
+            animate slide { duration: 250ms; easing: ease-out; }
+            x: root.width - self.width * self.slide + 4px * (1 - self.slide);
+            y: 0;
+            height: root.height;
+            open: root.queue-open;
+            items: root.queue;
+            play(i) => { root.play-queue-index(i); }
+            close => { root.queue-open = false; }
+        }
+
+        // URL dialog (modal)
+        if root.url-open: UrlDialog {
+            width: 100%; height: 100%;
+            url-list: root.url-list;
+            rejected <=> root.url-rejected;
+            add-urls(s) => { root.url-add(s); }
+            request-paste => { root.request-paste(); }
+            remove-url(i) => { root.url-remove(i); }
+            // Rust loads the list, clears it, and closes the dialog.
+            submit(user, pass) => { root.submit-urls(user, pass); }
+            cancel => { root.url-clear(); root.url-open = false; }
+            read-clipboard() => { return root.read-clipboard(); }
+            write-clipboard(s) => { root.write-clipboard(s); }
+        }
+    }
+    } // frame
+
+    // ---- frameless-window resize handles (hidden when fullscreen/maximized;
+    // the container Rectangle doesn't consume input, only the TouchAreas do) ----
+    Rectangle {
+        // Explicit full-window size: without it the container can resolve to a
+        // child-derived preferred size and get centred, which put the "edge"
+        // strips (and their resize cursors) in the middle of the player.
+        x: 0; y: 0;
+        width: 100%;
+        height: 100%;
+        // CSD only: native decorations (macOS) have system resize borders.
+        visible: root.alpha-surface && !root.win-square;
+        TouchArea {
+            x: 0; y: 14px; width: 5px; height: parent.height - 28px;
+            mouse-cursor: ew-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("w"); } }
+        }
+        TouchArea {
+            x: parent.width - 5px; y: 14px; width: 5px; height: parent.height - 28px;
+            mouse-cursor: ew-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("e"); } }
+        }
+        TouchArea {
+            x: 14px; y: 0; width: parent.width - 28px; height: 4px;
+            mouse-cursor: ns-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("n"); } }
+        }
+        TouchArea {
+            x: 14px; y: parent.height - 5px; width: parent.width - 28px; height: 5px;
+            mouse-cursor: ns-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("s"); } }
+        }
+        TouchArea {
+            x: 0; y: 0; width: 14px; height: 14px;
+            mouse-cursor: nwse-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("nw"); } }
+        }
+        TouchArea {
+            x: parent.width - 14px; y: 0; width: 14px; height: 14px;
+            mouse-cursor: nesw-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("ne"); } }
+        }
+        TouchArea {
+            x: 0; y: parent.height - 14px; width: 14px; height: 14px;
+            mouse-cursor: nesw-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("sw"); } }
+        }
+        TouchArea {
+            x: parent.width - 14px; y: parent.height - 14px; width: 14px; height: 14px;
+            mouse-cursor: nwse-resize;
+            pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.start-resize("se"); } }
+        }
+    }
+}
+
+// ---------- Preferences window (separate window) ----------
+// A visual colour picker row: the swatch opens a popup with a 2D
+// saturation/value field, a hue strip, a live preview and quick presets.
+// Works on a `color` value (set from Rust), emits `changed(color)`.
+//
+// HSV maths is done inline (Slint functions don't allow local variables): the
+// SV field's base is the pure hue, overlaid with white→transparent
+// (saturation) and transparent→black (value) gradients; `cur` recomposes the
+// picked colour from hue/sat/val via the standard sextant table.
+component ColorRow inherits Rectangle {
+    in property <string> title;
+    in property <color> value;
+    // Dimmed + non-interactive when its parent toggle is off (e.g. outline
+    // colour is meaningless while "Draw outline" is disabled).
+    in property <bool> enabled: true;
+    callback changed(color);
+
+    // working HSV (seeded from `value` each time the popup opens)
+    property <float> hue: 0;   // 0..360
+    property <float> sat: 0;   // 0..1
+    property <float> val: 1;   // 0..1
+
+    // HSV → RGB (sextant table). c/x/m are the standard chroma components.
+    property <float> cc: val * sat;
+    property <float> cx: cc * (1 - Math.abs(Math.mod(hue / 60, 2) - 1));
+    property <float> m: val - cc;
+    property <float> seg: Math.mod(Math.floor(hue / 60), 6);
+    property <float> r1: (seg == 0 || seg == 5) ? cc : ((seg == 1 || seg == 4) ? cx : 0);
+    property <float> g1: (seg == 1 || seg == 2) ? cc : ((seg == 0 || seg == 3) ? cx : 0);
+    property <float> b1: (seg == 3 || seg == 4) ? cc : ((seg == 2 || seg == 5) ? cx : 0);
+    property <color> cur: Colors.rgb(Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255));
+    // pure hue (s=1,v=1) for the SV-field base
+    property <float> hx: 1 - Math.abs(Math.mod(hue / 60, 2) - 1);
+    property <color> hue-color: Colors.rgb(
+        Math.round(((seg == 0 || seg == 5) ? 1 : ((seg == 1 || seg == 4) ? hx : 0)) * 255),
+        Math.round(((seg == 1 || seg == 2) ? 1 : ((seg == 0 || seg == 3) ? hx : 0)) * 255),
+        Math.round(((seg == 3 || seg == 4) ? 1 : ((seg == 2 || seg == 5) ? hx : 0)) * 255));
+
+    // RGB → HSV of `value`, used to seed hue/sat/val on open
+    property <float> vr: value.red / 255;
+    property <float> vg: value.green / 255;
+    property <float> vb: value.blue / 255;
+    property <float> vmax: Math.max(vr, Math.max(vg, vb));
+    property <float> vmin: Math.min(vr, Math.min(vg, vb));
+    property <float> vd: vmax - vmin;
+
+    property <[color]> presets: [#FFFFFF, #000000, #FFE100, #FF3B30, #34C759, #00C7BE, #0A84FF, #FF9F0A, #BF5AF2, #8E8E93];
+    height: 54px;
+    opacity: root.enabled ? 1.0 : 0.4;
+    HorizontalLayout {
+        padding-left: 16px; padding-right: 16px; spacing: 8px;
+        Text { text: root.title; color: #fffffff2; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+        Rectangle {
+            width: 40px;
+            Rectangle {
+                width: 30px; height: 22px; border-radius: 6px;
+                background: root.cur;
+                border-width: 1px; border-color: #ffffff3a;
+            }
+        }
+    }
+    ta := TouchArea { enabled: root.enabled; clicked => { popup.show(); } }
+    // Close on window resize (see Combo).
+    property <int> rf: Reflow.token;
+    changed rf => { popup.close(); }
+    popup := PopupWindow {
+        // Clicks INSIDE the picker must not dismiss it (dragging the field):
+        // only an outside click closes.
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        x: root.width - 250px; y: parent.height + 2px; width: 248px;
+        // Seed HSV from `value` each time the picker opens.
+        init => {
+            root.val = root.vmax;
+            root.sat = root.vmax == 0 ? 0 : root.vd / root.vmax;
+            root.hue = root.vd == 0 ? 0
+                : root.vmax == root.vr ? Math.mod(60 * Math.mod((root.vg - root.vb) / root.vd, 6) + 360, 360)
+                : root.vmax == root.vg ? 60 * ((root.vb - root.vr) / root.vd + 2)
+                : 60 * ((root.vr - root.vg) / root.vd + 4);
+        }
+        Rectangle {
+            background: #26262c; border-radius: 10px; border-width: 1px; border-color: #ffffff24;
+            VerticalLayout {
+                padding: 12px; spacing: 10px;
+                // 2D saturation / value field
+                field := Rectangle {
+                    width: 224px; height: 150px; border-radius: 8px;
+                    background: root.hue-color;
+                    // white (left) → transparent (right) = saturation
+                    Rectangle { width: 100%; height: 100%; border-radius: 8px;
+                        background: @linear-gradient(90deg, #ffffff 0%, #ffffff00 100%); }
+                    // transparent (top) → black (bottom) = value
+                    Rectangle { width: 100%; height: 100%; border-radius: 8px;
+                        background: @linear-gradient(180deg, #00000000 0%, #000000 100%); }
+                    // picked-point marker
+                    Rectangle {
+                        width: 16px; height: 16px; border-radius: 8px;
+                        background: transparent;
+                        border-width: 2px; border-color: #ffffff;
+                        x: root.sat * (parent.width - self.width);
+                        y: (1 - root.val) * (parent.height - self.height);
+                        Rectangle { width: 14px; height: 14px; x: 1px; y: 1px; border-radius: 7px; border-width: 1px; border-color: #00000080; }
+                    }
+                    fta := TouchArea {
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.down) {
+                                root.sat = Math.clamp(self.mouse-x / field.width, 0, 1);
+                                root.val = Math.clamp(1 - self.mouse-y / field.height, 0, 1);
+                                root.changed(root.cur);
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                root.sat = Math.clamp(self.mouse-x / field.width, 0, 1);
+                                root.val = Math.clamp(1 - self.mouse-y / field.height, 0, 1);
+                                root.changed(root.cur);
+                            }
+                        }
+                    }
+                }
+                // hue strip
+                hstrip := Rectangle {
+                    width: 224px; height: 16px; border-radius: 8px;
+                    background: @linear-gradient(90deg,
+                        #ff0000 0%, #ffff00 16.6%, #00ff00 33.3%, #00ffff 50%,
+                        #0000ff 66.6%, #ff00ff 83.3%, #ff0000 100%);
+                    Rectangle {
+                        width: 6px; height: 20px; y: -2px; border-radius: 3px;
+                        background: #ffffff; border-width: 1px; border-color: #00000080;
+                        x: (root.hue / 360) * (parent.width - self.width);
+                    }
+                    hta := TouchArea {
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.down) {
+                                root.hue = Math.clamp(self.mouse-x / hstrip.width, 0, 1) * 360;
+                                root.changed(root.cur);
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                root.hue = Math.clamp(self.mouse-x / hstrip.width, 0, 1) * 360;
+                                root.changed(root.cur);
+                            }
+                        }
+                    }
+                }
+                // preview swatch
+                HorizontalLayout {
+                    spacing: 10px;
+                    Rectangle { width: 40px; height: 24px; border-radius: 6px; background: root.cur; border-width: 1px; border-color: #ffffff3a; }
+                    Text { text: Math.round(root.cur.red) + ", " + Math.round(root.cur.green) + ", " + Math.round(root.cur.blue);
+                        color: #ffffffd1; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
+                }
+                // presets
+                HorizontalLayout {
+                    spacing: 6px;
+                    for c in root.presets: Rectangle {
+                        height: 20px; border-radius: 5px; background: c;
+                        border-width: 1px; border-color: #ffffff3a;
+                        TouchArea {
+                            clicked => {
+                                root.hue = pick.hue; root.sat = pick.sat; root.val = pick.val;
+                                root.changed(Colors.rgb(Math.round(c.red), Math.round(c.green), Math.round(c.blue)));
+                            }
+                            // per-preset HSV (same inline maths as the seed below)
+                            property <float> pr: c.red / 255;
+                            property <float> pg: c.green / 255;
+                            property <float> pb: c.blue / 255;
+                            property <float> pmax: Math.max(pr, Math.max(pg, pb));
+                            property <float> pmin: Math.min(pr, Math.min(pg, pb));
+                            property <float> pdl: pmax - pmin;
+                            pick := Rectangle {
+                                property <float> hue: pdl == 0 ? 0
+                                    : pmax == pr ? Math.mod(60 * Math.mod((pg - pb) / pdl, 6) + 360, 360)
+                                    : pmax == pg ? 60 * ((pb - pr) / pdl + 2)
+                                    : 60 * ((pr - pg) / pdl + 4);
+                                property <float> sat: pmax == 0 ? 0 : pdl / pmax;
+                                property <float> val: pmax;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Search box at the top of the preferences content.
+component PrefSearchField inherits Rectangle {
+    in property <string> placeholder: "Search settings";
+    out property <string> text: ti.text;
+    callback edited(string);
+    public function clear() { ti.text = ""; root.edited(""); }
+
+    height: 44px;
+    border-radius: 12px;
+    background: #ffffff0a;
+    border-width: 1px;
+    border-color: ti.has-focus ? #3584e4 : #ffffff14;
+
+    HorizontalLayout {
+        padding-left: 14px; padding-right: 12px; spacing: 10px;
+        // wrapper fills the row height; the icon is centred within it
+        Rectangle {
+            width: 16px;
+            Image {
+                width: 16px; height: 16px;
+                y: (parent.height - self.height) / 2;
+                source: @image-url("icons/search.svg");
+                opacity: ti.has-focus ? 0.85 : 0.45;
+            }
+        }
+        ti := TextInput {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            color: #ffffff; font-size: 14px;
+            vertical-alignment: center;
+            single-line: true;
+            edited => { root.edited(self.text); }
+        }
+        // clear button when there's a query
+        if ti.text != "": Rectangle {
+            width: 22px;
+            Rectangle {
+                width: 22px; height: 22px; border-radius: 11px;
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                background: xa.has-hover ? #ffffff24 : #ffffff14;
+                Text { text: "✕"; color: #ffffffcc; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                xa := TouchArea { clicked => { root.clear(); } }
+            }
+        }
+    }
+    // Placeholder, left-aligned where the text starts (padding + icon + spacing).
+    if ti.text == "": Text {
+        x: 40px;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: #ffffff5e; font-size: 14px;
+    }
+}
+
+export component PrefsWindow inherits Window {
+    in property <[ShortcutItem]> shortcuts;
+    callback adjust(string, float);
+    callback set-resume(int);
+    callback set-mouse-single(int);
+    callback set-mouse-double(int);
+    callback set-mouse-right(int);
+    callback toggle-netstats(bool);
+    callback toggle-fps(bool);
+    callback set-sub-pos-mode(int);
+    callback set-outline(bool);
+    callback set-shadow(bool);
+    callback set-shaded-bg(bool);
+    callback set-text-color(color);
+    callback set-outline-color(color);
+    callback set-shadow-color(color);
+    callback set-bg-color(color);
+    // Searchable system-font picker: `sub-font-search` filters the list Rust
+    // pushes back into `sub-font-options`; `set-sub-font-name` applies a pick.
+    callback sub-font-search(string);
+    callback set-sub-font-name(string);
+    callback capture-key(int, string);
+    callback reset-shortcuts;
+    callback close-prefs;
+    // Settings search: Rust filters (Slint has no string.contains) and pushes
+    // matching settings into `search-results`; non-empty query = results mode.
+    callback search(string);
+    in property <[SearchHit]> search-results;
+
+    // Saved settings, pushed in from Rust so the controls open reflecting the
+    // persisted config rather than hard-coded defaults.
+    in property <int> init-resume: 1;
+    in property <int> init-mouse-single: 2;
+    in property <int> init-mouse-double: 3;
+    in property <int> init-mouse-right: 1;
+    in property <color> init-text-color: #FFFFFF;
+    in property <color> init-outline-color: #000000;
+    in property <float> init-outline-size: 3;
+    in property <color> init-shadow-color: #000000;
+    in property <float> init-shadow-offset: 2;
+    in property <color> init-bg-color: #000000;
+    in property <float> init-bg-opacity: 50;
+    in property <float> init-box-padding: 6;
+    in property <float> init-line-spacing: 0;
+    // Current font family name + the (filtered) list to show in the picker.
+    in property <string> init-sub-font-name: "Sans";
+    in property <[string]> sub-font-options;
+    in property <float> init-sub-font-size: 55;
+    in property <int> init-sub-pos-mode: 0;
+    in property <float> init-sub-pos: 100;
+    in property <float> init-sub-scale: 1;
+    in property <bool> init-outline: true;
+    in property <bool> init-shadow: true;
+    in property <bool> init-shaded-bg: false;
+
+    property <int> page: 0;
+    // Results mode when the search box has a query.
+    property <bool> searching: search-field.text != "";
+    property <int> capturing-index: -1;
+    // Live mirrors of the effect toggles, so each effect's colour/opacity rows
+    // can disable themselves when the effect is off.
+    property <bool> outline-on: root.init-outline;
+    property <bool> shadow-on: root.init-shadow;
+    property <bool> bg-on: root.init-shaded-bg;
+
+    title: "Soniq — Preferences";
+    preferred-width: 800px;
+    preferred-height: 600px;
+    // Floor so the two-column layout can't be crushed into the broken state.
+    min-width: 640px;
+    min-height: 480px;
+    background: #16161a;
+    forward-focus: cap;
+
+    // Close any open dropdown/picker when the window resizes (a PopupWindow is
+    // anchored at show-time and otherwise detaches to stale coordinates).
+    changed width => { Reflow.token += 1; }
+    changed height => { Reflow.token += 1; }
+
+    cap := FocusScope {
+        key-pressed(e) => {
+            if (root.capturing-index >= 0) {
+                if (e.text == Key.Escape) { root.capturing-index = -1; return accept; }
+                root.capture-key(root.capturing-index, KeyName.of(e.text, e.modifiers.control, e.modifiers.alt, e.modifiers.shift));
+                root.capturing-index = -1;
+                return accept;
+            }
+            return reject;
+        }
+
+        HorizontalLayout {
+            // sidebar
+            Rectangle {
+                width: 212px;
+                background: #0d0d10;
+                // hairline divider between sidebar and content
+                Rectangle { x: parent.width - 1px; width: 1px; background: #ffffff14; }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 4px;
+                    // branding header
+                    HorizontalLayout {
+                        padding-left: 6px; padding-top: 6px; padding-bottom: 12px; spacing: 11px;
+                        Image { width: 26px; height: 26px; image-fit: contain; source: @image-url("icons/wordmark.svg"); }
+                        Text { text: "Preferences"; color: #ffffff; font-size: 17px; font-weight: 800; vertical-alignment: center; }
+                    }
+                    // One global search at the top of the nav (not repeated per page).
+                    search-field := PrefSearchField {
+                        placeholder: "Search";
+                        edited(q) => { root.search(q); }
+                    }
+                    Rectangle { height: 8px; }
+                    DrawerTab { label: "General"; has-icon: true; icon: @image-url("icons/tab-general.svg"); active: root.page == 0 && !root.searching; clicked => { search-field.clear(); root.page = 0; } }
+                    DrawerTab { label: "Shortcuts"; has-icon: true; icon: @image-url("icons/tab-keyboard.svg"); active: root.page == 1 && !root.searching; clicked => { search-field.clear(); root.page = 1; } }
+                    DrawerTab { label: "Subtitles"; has-icon: true; icon: @image-url("icons/subtitles.svg"); active: root.page == 2 && !root.searching; clicked => { search-field.clear(); root.page = 2; } }
+                    DrawerTab { label: "Mouse"; has-icon: true; icon: @image-url("icons/tab-mouse.svg"); active: root.page == 3 && !root.searching; clicked => { search-field.clear(); root.page = 3; } }
+                    Rectangle { vertical-stretch: 1; }
+                    Pill { label: "Close"; primary: true; clicked => { root.close-prefs(); } }
+                }
+            }
+
+            // content — Flickable scrolled by the wheel only (interactive:false
+            // disables click-drag flicking, which felt like a touchscreen), and
+            // with no chunky scrollbar.
+            Flickable {
+                horizontal-stretch: 1;
+                interactive: false;
+                viewport-height: body.preferred-height;
+                body := VerticalLayout {
+                    padding: 24px;
+                    spacing: 18px;
+
+                    // ----- search results (when the query is non-empty) -----
+                    if root.searching: VerticalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: root.search-results.length > 0
+                                ? root.search-results.length + (root.search-results.length == 1 ? " result" : " results")
+                                : "No settings found";
+                            color: #ffffff80; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+                        }
+                        for hit in root.search-results: Rectangle {
+                            height: 58px; border-radius: 12px;
+                            background: ra.has-hover ? #26262e : #1f1f25;
+                            border-width: 1px; border-color: #ffffff12;
+                            animate background { duration: 100ms; }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px; horizontal-stretch: 1;
+                                    Text { text: hit.title; color: #ffffff; font-size: 14px; font-weight: 600; }
+                                    Text { text: hit.category; color: #ffffff80; font-size: 12px; }
+                                }
+                                Text { text: "›"; color: #ffffff80; font-size: 20px; vertical-alignment: center; }
+                            }
+                            ra := TouchArea { clicked => { root.page = hit.page; search-field.clear(); } }
+                        }
+                    }
+
+                    // ===== General =====
+                    if root.page == 0 && !root.searching: VerticalLayout {
+                        spacing: 16px;
+                        GroupCard {
+                            title: "Playback";
+                            ComboRow { title: "Resume playback"; options: ["Off", "Ask each time", "Always resume"]; current: root.init-resume; changed(i) => { root.set-resume(i); } }
+                        }
+                        GroupCard {
+                            title: "Developer";
+                            SwitchRow { title: "Show network stats"; toggled(v) => { root.toggle-netstats(v); } }
+                            RowSep {}
+                            SwitchRow { title: "Show FPS"; toggled(v) => { root.toggle-fps(v); } }
+                        }
+                    }
+
+                    // ===== Shortcuts =====
+                    if root.page == 1 && !root.searching: VerticalLayout {
+                        spacing: 12px;
+                        HorizontalLayout {
+                            Text { text: "Keyboard shortcuts"; color: #ffffff8c; font-size: 13px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                            Pill { label: "Reset to defaults"; clicked => { root.reset-shortcuts(); } }
+                        }
+                        GroupCard {
+                            for s[i] in root.shortcuts: Rectangle {
+                                height: 42px; border-radius: 8px;
+                                background: (i == root.capturing-index) ? #3584e433 : (sa.has-hover ? #ffffff12 : transparent);
+                                HorizontalLayout {
+                                    padding-left: 12px; padding-right: 12px;
+                                    Text { text: s.title; color: #ffffffeb; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Text {
+                                        text: (i == root.capturing-index) ? "Press a key…  (Esc cancels)" : s.keys;
+                                        color: (i == root.capturing-index) ? #4593f0 : #ffffff;
+                                        font-size: 13px; font-weight: 600; vertical-alignment: center;
+                                    }
+                                }
+                                sa := TouchArea { clicked => { root.capturing-index = i; cap.focus(); } }
+                            }
+                        }
+                        Text { text: "Click a binding, then press the new key. Esc cancels."; color: #ffffff73; font-size: 12px; }
+                    }
+
+                    // ===== Subtitles =====
+                    if root.page == 2 && !root.searching: VerticalLayout {
+                        spacing: 18px;
+                        GroupCard {
+                            title: "Font";
+                            FontPickerRow {
+                                title: "Family";
+                                current-name: root.init-sub-font-name;
+                                options: root.sub-font-options;
+                                search(q) => { root.sub-font-search(q); }
+                                picked(name) => { root.set-sub-font-name(name); }
+                            }
+                            RowSep {}
+                            // One size knob (mpv sub-font-size). The old separate
+                            // "Scale" multiplier on top of this just confused
+                            // people — both made the text bigger.
+                            SliderRow { title: "Size"; min: 20; max: 120; default-val: root.init-sub-font-size; decimals: 0; changed(v) => { root.adjust("sub-font-size", v); } }
+                        }
+                        GroupCard {
+                            title: "Text colour";
+                            ColorRow { title: "Colour"; value: root.init-text-color; changed(c) => { root.set-text-color(c); } }
+                        }
+                        GroupCard {
+                            title: "Outline";
+                            SwitchRow { title: "Draw outline"; on: root.init-outline; toggled(v) => { root.outline-on = v; root.set-outline(v); } }
+                            RowSep {}
+                            // Dependent on the toggle above — disabled when off.
+                            SliderRow { title: "Width"; enabled: root.outline-on; min: 0; max: 8; default-val: root.init-outline-size; decimals: 1; changed(v) => { root.adjust("sub-border-size", v); } }
+                            RowSep {}
+                            ColorRow { title: "Outline colour"; enabled: root.outline-on; value: root.init-outline-color; changed(c) => { root.set-outline-color(c); } }
+                        }
+                        GroupCard {
+                            title: "Drop shadow";
+                            SwitchRow { title: "Draw shadow"; on: root.init-shadow; toggled(v) => { root.shadow-on = v; root.set-shadow(v); } }
+                            RowSep {}
+                            SliderRow { title: "Offset"; enabled: root.shadow-on; min: 0; max: 8; default-val: root.init-shadow-offset; decimals: 1; changed(v) => { root.adjust("sub-shadow-offset", v); } }
+                            RowSep {}
+                            ColorRow { title: "Shadow colour"; enabled: root.shadow-on; value: root.init-shadow-color; changed(c) => { root.set-shadow-color(c); } }
+                        }
+                        GroupCard {
+                            title: "Background box";
+                            SwitchRow { title: "Shaded background"; on: root.init-shaded-bg; toggled(v) => { root.bg-on = v; root.set-shaded-bg(v); } }
+                            RowSep {}
+                            ColorRow { title: "Background colour"; enabled: root.bg-on; value: root.init-bg-color; changed(c) => { root.set-bg-color(c); } }
+                            RowSep {}
+                            SliderRow { title: "Opacity"; enabled: root.bg-on; min: 0; max: 100; default-val: root.init-bg-opacity; decimals: 0; unit: "%"; changed(v) => { root.adjust("sub-bg-opacity", v); } }
+                        }
+                        GroupCard {
+                            title: "Position";
+                            ComboRow { title: "Anchor"; options: ["Bottom", "Top", "Center"]; current: root.init-sub-pos-mode; changed(i) => { root.set-sub-pos-mode(i); } }
+                            RowSep {}
+                            SliderRow { title: "Vertical offset"; min: 0; max: 150; default-val: root.init-sub-pos; decimals: 0; changed(v) => { root.adjust("sub-pos", v); } }
+                            RowSep {}
+                            // Extra gap between lines; with a background box this
+                            // also separates the per-line boxes further.
+                            SliderRow { title: "Line spacing"; min: 0; max: 50; default-val: root.init-line-spacing; decimals: 0; changed(v) => { root.adjust("sub-line-spacing", v); } }
+                        }
+                    }
+
+                    // ===== Mouse =====
+                    if root.page == 3 && !root.searching: VerticalLayout {
+                        spacing: 16px;
+                        GroupCard {
+                            title: "Mouse on video";
+                            ComboRow { title: "Single click"; options: ["None", "Play / Pause", "Toggle controls", "Toggle fullscreen", "Mute"]; current: root.init-mouse-single; changed(i) => { root.set-mouse-single(i); } }
+                            RowSep {}
+                            ComboRow { title: "Double click"; options: ["None", "Play / Pause", "Toggle controls", "Toggle fullscreen", "Mute"]; current: root.init-mouse-double; changed(i) => { root.set-mouse-double(i); } }
+                            RowSep {}
+                            ComboRow { title: "Right click"; options: ["None", "Play / Pause", "Toggle controls", "Toggle fullscreen", "Mute"]; current: root.init-mouse-right; changed(i) => { root.set-mouse-right(i); } }
+                        }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+        }
+    }
+}

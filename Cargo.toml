@@ -1,18 +1,40 @@
 [package]
 name = "soniq"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
-description = "Soniq — a minimal, modern GTK4/libadwaita video player"
+description = "Soniq - a minimal, modern cross-platform video player (Rust + Slint + libmpv)"
 license = "MIT"
 
 [dependencies]
-gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
-adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
-gst = { version = "0.23", package = "gstreamer" }
-gst-app = { version = "0.23", package = "gstreamer-app" }
+dirs = "6.0.0"
 encoding_rs = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+fontdb = "0.23"
+euclid = "0.22"
+glow = "0.17"
+libmpv2 = "6.0.0"
+libmpv2-sys = "4.0.1"
+rfd = "0.15"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+slint = { version = "1.8", default-features = false, features = [
+    "backend-winit",
+    "renderer-skia-opengl",
+    "compat-1-2",
+    "unstable-winit-030",
+] }
+
+# Wayland opaque-region for the custom-decorated window (body opaque, only the
+# rounded corners alpha-blended) and native drag-and-drop / clipboard — Linux
+# only; macOS/Windows compositors handle these natively (see the *_opaque /
+# wl_dnd stubs).
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+libc = "0.2"
+
+[build-dependencies]
+pkg-config = "0.3"
+slint-build = "1.8"
 
 [profile.release]
 lto = "thin"
@@ -22,7 +44,7 @@ strip = true
 [package.metadata.deb]
 maintainer = "Ali <ali@spentys.com>"
 copyright = "2026, Ali <ali@spentys.com>"
-extended-description = "Soniq — a minimal, modern video player built with Rust, GTK4, libadwaita and GStreamer."
+extended-description = "Soniq - a minimal, modern cross-platform video player built with Rust, Slint and libmpv."
 section = "video"
 priority = "optional"
 assets = [
@@ -30,4 +52,5 @@ assets = [
     ["packaging/io.github.alisp.Soniq.desktop", "usr/share/applications/", "644"],
     ["assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/io.github.alisp.Soniq.svg", "644"],
 ]
-depends = "$auto, libgtk-4-1, libadwaita-1-0, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, gstreamer1.0-gtk4, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav"
+# cargo-deb auto-detects the linked shared libs (libmpv, GL, Wayland …).
+depends = "$auto"

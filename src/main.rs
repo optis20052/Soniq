@@ -1,176 +1,116 @@
+slint::include_modules!();
+
 mod config;
-mod effects;
+mod diagnostics;
 mod handlers;
-mod osd;
-mod pipeline;
-mod resume;
-mod shine;
+mod ipc;
+mod prefs;
+mod render;
 mod shortcuts;
-mod state;
-mod subtitles;
-mod theme;
-mod ui;
+mod store;
+mod subs;
 mod util;
+mod video;
+mod wl_dnd;
+mod wl_opaque;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use util::{fit_window_size, probe_video_size};
 
-use adw::prelude::*;
-use gtk::gio;
-use gtk::glib;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse args: a positional file plus an optional `--new-window` flag (also
+    // honoured via SONIQ_NEW_WINDOW) that forces a fresh window even when an
+    // instance is already running.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let force_new =
+        args.iter().any(|a| a == "--new-window") || std::env::var("SONIQ_NEW_WINDOW").is_ok();
+    let cli_file = args.into_iter().find(|a| !a.starts_with("--"));
 
-use state::AppState;
-use util::APP_ID;
-
-/// The app icon (window/taskbar), embedded so the binary is self-contained.
-const LOGO_SVG: &[u8] = include_bytes!("../assets/logo.svg");
-/// The wordmark logo shown on the empty/welcome screen.
-const WORDMARK_SVG: &[u8] = include_bytes!("../assets/soniq.svg");
-/// Icon-theme name for the welcome-screen wordmark.
-pub const WORDMARK_ICON: &str = "soniq-wordmark";
-
-fn main() -> glib::ExitCode {
-    gst::init().expect("Failed to initialize GStreamer");
-    // NVDEC hardware decoding stays at its default (high) rank for smooth,
-    // low-CPU 4K playback. Its seek-freeze bug is handled by the stall
-    // watchdog (non-flushing pause/resume → Ready-cycle recovery) in
-    // handlers.rs rather than by avoiding the decoder.
-
-    // Soniq is a single-instance app (HANDLES_OPEN lets file-manager "Open
-    // With Soniq" and `soniq file.mp4` deliver files via the `open` signal),
-    // but it supports many windows inside that one process — like Files or a
-    // browser. The two GApplication signals split cleanly:
-    //
-    //   * `activate` — fired on first launch, and again whenever the user asks
-    //     for a fresh instance (shift/middle-click the dock icon, the dock's
-    //     "New Window" action, or running `soniq` while it is already up). Each
-    //     time we open a brand-new window. A plain click on a running icon just
-    //     raises the existing window and never reaches here.
-    //   * `open` — a file double-click / `soniq file.mp4`. We load it into the
-    //     active (or most-recent) window so opening files reuses the window,
-    //     creating one only when none exists yet.
-    //
-    // GtkApplication keeps the process alive while any window is open and quits
-    // once the last one closes, so the window registry is all the bookkeeping
-    // multi-window needs.
-    let app = adw::Application::builder()
-        .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN)
-        .build();
-
-    // Display-global setup that must run exactly once, before any window.
-    app.connect_startup(|_| {
-        ui::install_css();
-        install_branding();
-    });
-
-    // Live windows, so `open` can target the right one and we can drop a window
-    // when it closes. Shared by reference into the signal handlers.
-    let windows: Rc<RefCell<Vec<Player>>> = Rc::new(RefCell::new(Vec::new()));
-
-    {
-        let windows = windows.clone();
-        app.connect_activate(move |app| {
-            new_window(app, &windows);
-        });
-    }
-    {
-        let windows = windows.clone();
-        app.connect_open(move |app, files, _hint| {
-            let player = active_player(app, &windows)
-                .unwrap_or_else(|| new_window(app, &windows));
-            for file in files {
-                (player.load_file)(file);
-            }
-            player.window.present();
-        });
-    }
-    app.run()
-}
-
-/// A single player window plus the closure that loads a file into it.
-#[derive(Clone)]
-struct Player {
-    window: adw::ApplicationWindow,
-    load_file: Rc<dyn Fn(&gio::File)>,
-}
-
-/// Build a fresh, fully independent player window (its own state, pipeline and
-/// handlers), register it, present it, and return a handle to it.
-fn new_window(app: &adw::Application, windows: &Rc<RefCell<Vec<Player>>>) -> Player {
-    let state = AppState::new();
-    config::apply_to_state(&config::load(), &state);
-
-    let pipe = pipeline::build_pipeline(&state);
-    let ui = ui::build_ui(app, &pipe.paintable);
-    let load_file = handlers::wire(&ui, &pipe, &state);
-
-    let player = Player {
-        window: ui.window.clone(),
-        load_file,
+    // Single-instance coordination: hand a file to the running instance, or run a
+    // new window, or become the primary (see ipc.rs). `Exit` = handed off already.
+    let serve_listener = match ipc::coordinate(cli_file.as_deref(), force_new) {
+        ipc::Launch::Exit => return Ok(()),
+        ipc::Launch::Primary(l) => Some(l),
+        ipc::Launch::Standalone => None,
     };
-    windows.borrow_mut().push(player.clone());
+    let is_primary = serve_listener.is_some();
 
-    // Drop the window from the registry once it closes so it can be freed (and
-    // so `open` never targets a dead window). GtkApplication quits the process
-    // when its last window goes away.
-    {
-        let windows = windows.clone();
-        let window_weak = ui.window.downgrade();
-        ui.window.connect_close_request(move |_| {
-            if let Some(closing) = window_weak.upgrade() {
-                windows.borrow_mut().retain(|p| p.window != closing);
-            }
-            glib::Propagation::Proceed
-        });
+    // If launched with a (local) file, probe its size first so we can create the
+    // window already at the video's aspect — resizing a *live* GL window flashes
+    // black (a known winit/glutin limitation), so we avoid the resize entirely by
+    // sizing up front, launcher-style. SONIQ_NO_PRESIZE exercises the in-app path.
+    let initial_size = cli_file
+        .as_deref()
+        .filter(|p| !p.contains("://"))
+        .filter(|_| std::env::var("SONIQ_NO_PRESIZE").is_err())
+        .and_then(probe_video_size)
+        .map(fit_window_size);
+
+    // Platform window styles:
+    // - Linux: client-side decorated — frameless, transparent surface, our own
+    //   punched rounded corners + chrome (SONIQ_OPAQUE=1 falls back to opaque).
+    // - macOS: NATIVE decorations — all CSD machinery off via alpha-surface=false.
+    let native_decor = cfg!(target_os = "macos");
+    let force_opaque = std::env::var("SONIQ_OPAQUE").is_ok() || native_decor;
+    // Must equal the installed .desktop basename so the compositor associates the
+    // window with it (correct app name + icon in the dock / task switcher).
+    const APP_ID: &str = "io.github.alisp.Soniq";
+    slint::BackendSelector::new()
+        .with_winit_window_attributes_hook(move |attrs| {
+            let attrs = attrs.with_transparent(!force_opaque);
+            // The hook runs after Slint's own attributes — overrides `no-frame`.
+            let attrs = if native_decor { attrs.with_decorations(true) } else { attrs };
+            // Wayland app_id / X11 WM_CLASS → match io.github.alisp.Soniq.desktop.
+            #[cfg(target_os = "linux")]
+            let attrs = {
+                use slint::winit_030::winit::platform::wayland::WindowAttributesExtWayland;
+                use slint::winit_030::winit::platform::x11::WindowAttributesExtX11;
+                let attrs = WindowAttributesExtWayland::with_name(attrs, APP_ID, "");
+                WindowAttributesExtX11::with_name(attrs, APP_ID, "")
+            };
+            attrs
+        })
+        .select()?;
+
+    let app = App::new()?;
+    app.set_alpha_surface(!force_opaque);
+    // Set the probed size before the window is shown so it never resizes.
+    if let Some((w, h)) = initial_size {
+        app.window().set_size(slint::LogicalSize::new(w, h));
+    }
+    // Screenshot / diagnostic env hooks (no-op in normal use).
+    if std::env::var("SONIQ_SHOT").is_ok() {
+        app.window()
+            .set_position(slint::LogicalPosition::new(120.0, 90.0));
+    }
+    if std::env::var("SONIQ_SHOT_DRAWER").is_ok() {
+        app.set_has_video(true);
+        app.set_drawer_open(true);
+    }
+    if std::env::var("SONIQ_SHOT_URL").is_ok() {
+        app.set_url_open(true);
     }
 
-    player.window.present();
-    player
-}
+    // main is just the composition root: build state, wire callbacks, install the
+    // render bridge + housekeeping, launch the CLI file. Logic lives in handlers.
+    let ctx = handlers::build(&app);
+    let set_fullscreen = handlers::wire(&app, &ctx);
+    render::install(&app, ctx.render_deps());
+    handlers::housekeeping(&app, &ctx);
+    handlers::launch_cli(&ctx, cli_file);
 
-/// The player whose window is currently focused, falling back to the most
-/// recently opened one. `None` only when no window is open at all.
-fn active_player(app: &adw::Application, windows: &Rc<RefCell<Vec<Player>>>) -> Option<Player> {
-    let windows = windows.borrow();
-    if let Some(active) = app.active_window() {
-        if let Some(p) = windows
-            .iter()
-            .find(|p| p.window.upcast_ref::<gtk::Window>() == &active)
-        {
-            return Some(p.clone());
-        }
+    // As the primary, serve file handoffs from later launches into this window.
+    if let Some(listener) = serve_listener {
+        ipc::serve(listener, app.as_weak());
     }
-    windows.last().cloned()
-}
 
-/// Register the embedded logo as the app icon so the window, taskbar, and the
-/// empty-state branding all show it (referenced everywhere by APP_ID).
-fn install_branding() {
-    // Write the SVG into a runtime icon theme dir and add it to the search
-    // path. Scalable icons need no cache, so this works immediately.
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME").ok().map(|h| {
-                let mut p = std::path::PathBuf::from(h);
-                p.push(".local/share");
-                p
-            })
-        });
-    if let Some(mut base) = base {
-        base.push("soniq/icons");
-        let apps = base.join("hicolor/scalable/apps");
-        if std::fs::create_dir_all(&apps).is_ok() {
-            let _ = std::fs::write(apps.join(format!("{APP_ID}.svg")), LOGO_SVG);
-            let _ = std::fs::write(apps.join(format!("{WORDMARK_ICON}.svg")), WORDMARK_SVG);
-            if let Some(display) = gtk::gdk::Display::default() {
-                gtk::IconTheme::for_display(&display).add_search_path(&base);
-            }
-        }
+    // Scripted UI diagnostics (no-op unless a SONIQ_* var is set).
+    diagnostics::install(&app, &set_fullscreen);
+
+    app.run()?;
+
+    // Only the primary owns the socket file; remove it on a clean exit.
+    if is_primary {
+        ipc::cleanup();
     }
-    gtk::Window::set_default_icon_name(APP_ID);
+    Ok(())
 }
-

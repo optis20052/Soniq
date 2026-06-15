@@ -1,142 +1,170 @@
+//! On-disk user settings — keybindings, volume, resume mode, mouse actions and
+//! subtitle style. Mirrors the original GTK app's `config.rs` so these settings
+//! persist across launches instead of resetting every time (the spike used to
+//! only persist the recents list).
+//!
+//! Stored as `config.json` alongside the recents store. Every field is optional
+//! so older/newer config files load gracefully (missing fields fall back to
+//! defaults).
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::resume::ResumeMode;
-use crate::shortcuts::{Action, Shortcut};
-use crate::state::AppState;
-use crate::subtitles::SubtitleStyle;
+/// How the player treats a previously-watched file on reopen.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
+pub enum ResumeMode {
+    /// Never remember / never resume.
+    Off,
+    /// Show a prompt offering to resume.
+    #[default]
+    Ask,
+    /// Resume automatically, no prompt.
+    Always,
+}
 
-/// On-disk settings. Every field is optional so older/newer configs load
-/// gracefully (missing fields fall back to defaults).
-#[derive(Default, Serialize, Deserialize)]
+impl ResumeMode {
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            0 => ResumeMode::Off,
+            2 => ResumeMode::Always,
+            _ => ResumeMode::Ask,
+        }
+    }
+    pub fn to_index(self) -> i32 {
+        match self {
+            ResumeMode::Off => 0,
+            ResumeMode::Ask => 1,
+            ResumeMode::Always => 2,
+        }
+    }
+}
+
+/// Persisted subtitle appearance. Indices match the spike's palette/font/combo
+/// orderings in `main.rs` and `app.slint`.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SubStyle {
+    // Colours are now free-form hex ("#RRGGBB"), set via a full RGB picker
+    // rather than an 8-swatch palette index. Older configs (which stored the
+    // dropped `color`/`border_color` ints) fall back to these defaults.
+    #[serde(default = "white_hex")]
+    pub text_color: String,
+    // Font family name (mpv `sub-font`), e.g. "Sans", "DejaVu Serif".
+    #[serde(default = "default_font_name")]
+    pub font_name: String,
+    #[serde(default = "default_font_size")]
+    pub font_size: i64, // mpv `sub-font-size`
+    pub scale: f64,        // sub-scale
+    pub pos_mode: i32,     // 0 bottom / 1 top / 2 center
+    pub pos: f64,          // sub-pos vertical offset
+    pub outline: bool, // draw outline
+    #[serde(default = "black_hex")]
+    pub outline_color: String,
+    #[serde(default = "default_outline_size")]
+    pub outline_size: f64, // mpv sub-border-size (outline width)
+    pub shadow: bool, // draw drop shadow
+    #[serde(default = "black_hex")]
+    pub shadow_color: String,
+    #[serde(default = "default_shadow_offset")]
+    pub shadow_offset: f64, // mpv sub-shadow-offset
+    pub shaded_bg: bool, // shaded background box behind the text
+    #[serde(default = "black_hex")]
+    pub bg_color: String,
+    #[serde(default = "default_bg_opacity")]
+    pub bg_opacity: i64, // 0–100 (alpha of the background box)
+    #[serde(default = "default_box_padding")]
+    pub box_padding: f64, // space between text and box edge (mpv border-size in box mode)
+    #[serde(default)]
+    pub line_spacing: f64, // extra gap between subtitle lines (mpv sub-line-spacing)
+}
+
+fn default_font_name() -> String {
+    "Sans".to_string()
+}
+fn default_font_size() -> i64 {
+    55
+}
+fn white_hex() -> String {
+    "#FFFFFF".to_string()
+}
+fn black_hex() -> String {
+    "#000000".to_string()
+}
+fn default_bg_opacity() -> i64 {
+    50
+}
+fn default_outline_size() -> f64 {
+    3.0
+}
+fn default_shadow_offset() -> f64 {
+    2.0
+}
+fn default_box_padding() -> f64 {
+    6.0
+}
+
+impl Default for SubStyle {
+    fn default() -> Self {
+        Self {
+            text_color: white_hex(),
+            font_name: default_font_name(),
+            font_size: default_font_size(),
+            scale: 1.0,
+            pos_mode: 0,
+            pos: 100.0,
+            outline: true,
+            outline_color: black_hex(),
+            outline_size: default_outline_size(),
+            shadow: true,
+            shadow_color: black_hex(),
+            shadow_offset: default_shadow_offset(),
+            shaded_bg: false,
+            bg_color: black_hex(),
+            bg_opacity: default_bg_opacity(),
+            box_padding: default_box_padding(),
+            line_spacing: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    pub subtitle_style: Option<SubtitleStyle>,
-    pub show_fps: Option<bool>,
-    /// Subtitle size multiplier (the quick-settings "Scale").
-    pub subtitle_scale: Option<f64>,
-    /// Subtitle vertical offset / position (bottom margin in px).
-    pub subtitle_margin: Option<i32>,
-    pub show_debug: Option<bool>,
-    pub volume: Option<f64>,
-    /// action key → GTK accelerator string.
+    /// action key → key-name binding (the spike's normalised KeyName strings).
     pub shortcuts: Option<HashMap<String, String>>,
-    /// action key, or absent = "no action".
-    pub mouse_single: Option<String>,
-    pub mouse_double: Option<String>,
-    /// Resume-playback behaviour (off / ask / always).
+    pub volume: Option<f64>,
+    pub muted: Option<bool>,
     pub resume_mode: Option<ResumeMode>,
+    /// Mouse-on-video click actions, by combo index (see app.slint Mouse page).
+    pub mouse_single: Option<i32>,
+    pub mouse_double: Option<i32>,
+    pub mouse_right: Option<i32>,
+    pub show_fps: Option<bool>,
+    pub sub_style: Option<SubStyle>,
 }
 
 fn config_path() -> Option<PathBuf> {
-    let mut dir = dirs_config_dir()?;
-    dir.push("soniq");
+    let dir = dirs::config_dir()?.join("soniq-spike");
     std::fs::create_dir_all(&dir).ok()?;
-    dir.push("config.json");
-    Some(dir)
+    Some(dir.join("config.json"))
 }
 
-/// XDG config dir ($XDG_CONFIG_HOME or ~/.config), without pulling in a crate.
-fn dirs_config_dir() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg));
+impl Config {
+    pub fn load() -> Self {
+        config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
-    std::env::var("HOME").ok().map(|h| {
-        let mut p = PathBuf::from(h);
-        p.push(".config");
-        p
-    })
-}
 
-/// Read settings from `AppState` into a serializable Config.
-pub fn from_state(state: &AppState) -> Config {
-    let shortcuts = Action::all()
-        .iter()
-        .filter_map(|a| {
-            state
-                .shortcuts
-                .get(*a)
-                .and_then(|s| s.accel_name())
-                .map(|accel| (a.key().to_string(), accel))
-        })
-        .collect();
-
-    Config {
-        subtitle_style: Some(state.subtitles.style.lock().unwrap().clone()),
-        show_fps: Some(state.show_fps.get()),
-        subtitle_scale: Some(state.subtitle_scale.get()),
-        subtitle_margin: Some(state.subtitle_margin.get()),
-        show_debug: Some(state.show_debug.get()),
-        volume: Some(state.volume.get()),
-        shortcuts: Some(shortcuts),
-        mouse_single: state.mouse.single.get().map(|a| a.key().to_string()),
-        mouse_double: state.mouse.double.get().map(|a| a.key().to_string()),
-        resume_mode: Some(state.resume_mode.get()),
-    }
-}
-
-/// Apply a loaded Config onto `AppState` (call before building the UI so the
-/// initial widgets reflect saved settings).
-pub fn apply_to_state(cfg: &Config, state: &AppState) {
-    if let Some(style) = &cfg.subtitle_style {
-        *state.subtitles.style.lock().unwrap() = style.clone();
-    }
-    if let Some(s) = cfg.subtitle_scale {
-        state.subtitle_scale.set(
-            s.clamp(crate::theme::SUBTITLE_SCALE_MIN, crate::theme::SUBTITLE_SCALE_MAX),
-        );
-    }
-    if let Some(m) = cfg.subtitle_margin {
-        state.subtitle_margin.set(m.clamp(0, crate::theme::SUBTITLE_MARGIN_MAX));
-    }
-    if let Some(debug) = cfg.show_debug {
-        state.show_debug.set(debug);
-    }
-    if let Some(fps) = cfg.show_fps {
-        state.show_fps.set(fps);
-    }
-    if let Some(v) = cfg.volume {
-        state.volume.set(v.clamp(0.0, 1.0));
-    }
-    if let Some(map) = &cfg.shortcuts {
-        for (key, accel) in map {
-            if let (Some(action), Some(sc)) = (Action::from_key(key), Shortcut::parse(accel)) {
-                state.shortcuts.set(action, sc);
-            }
+    /// Persist atomically (temp file + rename) so a crash mid-write can't
+    /// corrupt the existing config.
+    pub fn save(&self) {
+        let Some(path) = config_path() else { return };
+        let Ok(text) = serde_json::to_string_pretty(self) else { return };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
         }
-    }
-    state
-        .mouse
-        .single
-        .set(cfg.mouse_single.as_deref().and_then(Action::from_key));
-    state
-        .mouse
-        .double
-        .set(cfg.mouse_double.as_deref().and_then(Action::from_key));
-    if let Some(mode) = cfg.resume_mode {
-        state.resume_mode.set(mode);
-    }
-}
-
-/// Load the config from disk (or default if absent/unreadable).
-pub fn load() -> Config {
-    let Some(path) = config_path() else {
-        return Config::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Config::default(),
-    }
-}
-
-/// Persist the current state to disk.
-pub fn save(state: &AppState) {
-    let Some(path) = config_path() else { return };
-    let cfg = from_state(state);
-    if let Ok(text) = serde_json::to_string_pretty(&cfg) {
-        let _ = std::fs::write(&path, text);
     }
 }

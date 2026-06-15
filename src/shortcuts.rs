@@ -1,243 +1,148 @@
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+//! Keyboard shortcuts: the action table, the data-driven dispatcher that maps
+//! an action name to a player/UI command, and the key→action binding lookup.
+
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk::gdk;
+use slint::{ComponentHandle, VecModel};
 
-/// Every player action that can be triggered by a keyboard binding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Action {
-    PlayPause,
-    Fullscreen,
-    Mute,
-    VolumeUp,
-    VolumeDown,
-    SeekBackwardSmall,
-    SeekForwardSmall,
-    SeekBackwardLarge,
-    SeekForwardLarge,
-    JumpStart,
-    JumpEnd,
-    NextTrack,
-    PrevTrack,
-    OpenFile,
-    OpenUrl,
+use crate::util::fmt_time;
+use crate::video::VideoBridge;
+use crate::{App, ShortcutItem};
+
+/// "1:23 / 45:00" OSD string for a seek target.
+fn time_osd(t: f64, dur: f64) -> String {
+    format!("{} / {}", fmt_time(t.clamp(0.0, dur.max(0.0))), fmt_time(dur))
 }
 
-impl Action {
-    /// Human-readable name, shown in preferences.
-    pub fn title(self) -> &'static str {
-        match self {
-            Action::PlayPause => "Play / Pause",
-            Action::Fullscreen => "Toggle fullscreen",
-            Action::Mute => "Mute",
-            Action::VolumeUp => "Volume up",
-            Action::VolumeDown => "Volume down",
-            Action::SeekBackwardSmall => "Seek backward 5 s",
-            Action::SeekForwardSmall => "Seek forward 5 s",
-            Action::SeekBackwardLarge => "Seek backward 10 s",
-            Action::SeekForwardLarge => "Seek forward 10 s",
-            Action::JumpStart => "Jump to start",
-            Action::JumpEnd => "Jump to end",
-            Action::NextTrack => "Next file",
-            Action::PrevTrack => "Previous file",
-            Action::OpenFile => "Open file…",
-            Action::OpenUrl => "Open URL…",
-        }
-    }
+// (action key, display title, default binding) — order matches the prefs list.
+pub const ACTIONS: &[(&str, &str, &str)] = &[
+    ("play_pause", "Play / Pause", "Space"),
+    ("mute", "Mute", "m"),
+    ("fullscreen", "Toggle fullscreen", "f"),
+    ("seek_back_small", "Seek backward 5 s", "Left"),
+    ("seek_fwd_small", "Seek forward 5 s", "Right"),
+    ("seek_back_large", "Seek backward 10 s", "j"),
+    ("seek_fwd_large", "Seek forward 10 s", "l"),
+    ("volume_up", "Volume up", "Up"),
+    ("volume_down", "Volume down", "Down"),
+    ("jump_start", "Jump to start", "Home"),
+    ("jump_end", "Jump to end", "End"),
+    ("next_track", "Next file", "n"),
+    ("prev_track", "Previous file", "p"),
+    ("open_file", "Open file…", "Ctrl+o"),
+    ("open_url", "Open URL…", "Ctrl+l"),
+];
 
-    /// Stable string key for config persistence.
-    pub fn key(self) -> &'static str {
-        match self {
-            Action::PlayPause => "play_pause",
-            Action::Fullscreen => "fullscreen",
-            Action::Mute => "mute",
-            Action::VolumeUp => "volume_up",
-            Action::VolumeDown => "volume_down",
-            Action::SeekBackwardSmall => "seek_back_small",
-            Action::SeekForwardSmall => "seek_fwd_small",
-            Action::SeekBackwardLarge => "seek_back_large",
-            Action::SeekForwardLarge => "seek_fwd_large",
-            Action::JumpStart => "jump_start",
-            Action::JumpEnd => "jump_end",
-            Action::NextTrack => "next_track",
-            Action::PrevTrack => "prev_track",
-            Action::OpenFile => "open_file",
-            Action::OpenUrl => "open_url",
-        }
-    }
+/// Wire keyboard handling: builds the shortcuts list model (shown in prefs),
+/// the action dispatcher, and the `key → action` lookup. Returns the model and
+/// a `rebuild` closure so the prefs window can re-render the list after a
+/// binding changes.
+pub fn install(
+    app: &App,
+    bridge: Rc<RefCell<Option<VideoBridge>>>,
+    bindings: Rc<RefCell<Vec<String>>>,
+    set_fullscreen: Rc<dyn Fn(bool)>,
+    show_osd: Rc<dyn Fn(&str)>,
+) -> (Rc<VecModel<ShortcutItem>>, Rc<dyn Fn()>) {
+    let shortcuts_model = Rc::new(VecModel::<ShortcutItem>::default());
+    let rebuild_shortcuts: Rc<dyn Fn()> = {
+        let bindings = bindings.clone();
+        let shortcuts_model = shortcuts_model.clone();
+        Rc::new(move || {
+            let b = bindings.borrow();
+            let items: Vec<ShortcutItem> = ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, a)| ShortcutItem {
+                    title: a.1.into(),
+                    keys: b[i].clone().into(),
+                })
+                .collect();
+            shortcuts_model.set_vec(items);
+        })
+    };
+    rebuild_shortcuts();
 
-    /// Parse a stable key back into an Action.
-    pub fn from_key(key: &str) -> Option<Action> {
-        Action::all().iter().copied().find(|a| a.key() == key)
-    }
-
-    /// Stable iteration order for preferences UI.
-    pub fn all() -> &'static [Action] {
-        &[
-            Action::PlayPause,
-            Action::Mute,
-            Action::Fullscreen,
-            Action::SeekBackwardSmall,
-            Action::SeekForwardSmall,
-            Action::SeekBackwardLarge,
-            Action::SeekForwardLarge,
-            Action::VolumeUp,
-            Action::VolumeDown,
-            Action::JumpStart,
-            Action::JumpEnd,
-            Action::NextTrack,
-            Action::PrevTrack,
-            Action::OpenFile,
-            Action::OpenUrl,
-        ]
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Shortcut {
-    pub key: gdk::Key,
-    pub mods: gdk::ModifierType,
-}
-
-impl Shortcut {
-    /// Format as a human-friendly accelerator label (e.g. "Ctrl+O", "Space").
-    /// Uses GTK's own translation so the labels match other GNOME apps.
-    pub fn label(self) -> String {
-        gtk::accelerator_get_label(self.key, self.mods).to_string()
-    }
-
-    /// Parse from a GTK accelerator string like "<Control>o" or "space".
-    pub fn parse(accel: &str) -> Option<Self> {
-        let (key, mods) = gtk::accelerator_parse(accel)?;
-        Some(Self { key, mods })
-    }
-
-    /// Serialize to a GTK accelerator string (for config persistence).
-    pub fn accel_name(self) -> Option<String> {
-        let name = gtk::accelerator_name(self.key, self.mods).to_string();
-        if name.is_empty() { None } else { Some(name) }
-    }
-
-    /// Normalize a captured key event to a Shortcut. We strip "consumed"
-    /// modifiers (like Shift on already-shifted keys) so e.g. Shift+? doesn't
-    /// double-up. We also keep only Ctrl / Alt / Super / Shift bits.
-    pub fn from_event(key: gdk::Key, mods: gdk::ModifierType) -> Self {
-        let kept = gdk::ModifierType::CONTROL_MASK
-            | gdk::ModifierType::ALT_MASK
-            | gdk::ModifierType::SUPER_MASK
-            | gdk::ModifierType::SHIFT_MASK;
-        Self {
-            key,
-            mods: mods & kept,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Shortcuts {
-    inner: Rc<RefCell<HashMap<Action, Shortcut>>>,
-}
-
-/// Mouse-click bindings on the video area. `None` = no action.
-#[derive(Clone)]
-pub struct MouseBindings {
-    pub single: Rc<Cell<Option<Action>>>,
-    pub double: Rc<Cell<Option<Action>>>,
-}
-
-impl MouseBindings {
-    pub fn defaults() -> Self {
-        Self {
-            single: Rc::new(Cell::new(None)),
-            double: Rc::new(Cell::new(Some(Action::Fullscreen))),
-        }
-    }
-}
-
-impl Shortcuts {
-    pub fn defaults() -> Self {
-        let mut m = HashMap::new();
-        let none = gdk::ModifierType::empty();
-        let ctrl = gdk::ModifierType::CONTROL_MASK;
-        m.insert(Action::PlayPause, Shortcut { key: gdk::Key::space, mods: none });
-        m.insert(Action::Mute, Shortcut { key: gdk::Key::m, mods: none });
-        m.insert(Action::Fullscreen, Shortcut { key: gdk::Key::f, mods: none });
-        m.insert(
-            Action::SeekBackwardSmall,
-            Shortcut { key: gdk::Key::Left, mods: none },
-        );
-        m.insert(
-            Action::SeekForwardSmall,
-            Shortcut { key: gdk::Key::Right, mods: none },
-        );
-        m.insert(
-            Action::SeekBackwardLarge,
-            Shortcut { key: gdk::Key::j, mods: none },
-        );
-        m.insert(
-            Action::SeekForwardLarge,
-            Shortcut { key: gdk::Key::l, mods: none },
-        );
-        m.insert(Action::VolumeUp, Shortcut { key: gdk::Key::Up, mods: none });
-        m.insert(
-            Action::VolumeDown,
-            Shortcut { key: gdk::Key::Down, mods: none },
-        );
-        m.insert(
-            Action::JumpStart,
-            Shortcut { key: gdk::Key::Home, mods: none },
-        );
-        m.insert(Action::JumpEnd, Shortcut { key: gdk::Key::End, mods: none });
-        m.insert(Action::NextTrack, Shortcut { key: gdk::Key::n, mods: none });
-        m.insert(Action::PrevTrack, Shortcut { key: gdk::Key::p, mods: none });
-        m.insert(Action::OpenFile, Shortcut { key: gdk::Key::o, mods: ctrl });
-        m.insert(Action::OpenUrl, Shortcut { key: gdk::Key::l, mods: ctrl });
-        Self {
-            inner: Rc::new(RefCell::new(m)),
-        }
-    }
-
-    pub fn get(&self, a: Action) -> Option<Shortcut> {
-        self.inner.borrow().get(&a).copied()
-    }
-
-    pub fn set(&self, a: Action, s: Shortcut) {
-        self.inner.borrow_mut().insert(a, s);
-    }
-
-    /// Reset all bindings to the built-in defaults.
-    pub fn reset_to_defaults(&self) {
-        let defaults = Self::defaults();
-        let new_inner = defaults.inner.borrow().clone();
-        *self.inner.borrow_mut() = new_inner;
-    }
-
-    /// Find which Action (if any) the given key event invokes. Tries
-    /// case-insensitive match for letter keys so Shift+M still triggers
-    /// "M" binding.
-    pub fn lookup(&self, key: gdk::Key, mods: gdk::ModifierType) -> Option<Action> {
-        let kept = gdk::ModifierType::CONTROL_MASK
-            | gdk::ModifierType::ALT_MASK
-            | gdk::ModifierType::SUPER_MASK
-            | gdk::ModifierType::SHIFT_MASK;
-        let mods_clean = mods & kept;
-        let key_lower = key.to_lower();
-
-        for (action, sc) in self.inner.borrow().iter() {
-            let sc_mods = sc.mods & kept;
-            // Match modifiers ignoring Shift for letter-key bindings (so the
-            // user can type M or Shift+M for a binding defined as "m"), but
-            // require exact modifier match otherwise.
-            let modifiers_match = sc_mods == mods_clean
-                || (sc.mods.is_empty() && (mods_clean - gdk::ModifierType::SHIFT_MASK).is_empty());
-            if !modifiers_match {
-                continue;
+    let dispatch: Rc<dyn Fn(&str)> = {
+        let bridge = bridge.clone();
+        let weak = app.as_weak();
+        let set_fullscreen = set_fullscreen.clone();
+        let show_osd = show_osd.clone();
+        Rc::new(move |action: &str| {
+            if let Some(a) = weak.upgrade() {
+                match action {
+                    "open_file" => {
+                        a.invoke_open_file();
+                        return;
+                    }
+                    "open_url" => {
+                        a.set_url_open(true);
+                        return;
+                    }
+                    "fullscreen" => {
+                        let fs = !a.window().is_fullscreen();
+                        set_fullscreen(fs);
+                        show_osd(if fs { "Fullscreen" } else { "Windowed" });
+                        return;
+                    }
+                    _ => {}
+                }
             }
-            if sc.key == key || sc.key.to_lower() == key_lower {
-                return Some(*action);
+            if let Some(b) = bridge.borrow().as_ref() {
+                // mpv applies seeks/state async, so OSD targets are computed from
+                // the pre-action state rather than read back immediately.
+                let pos = b.position();
+                let dur = b.duration();
+                match action {
+                    "play_pause" => {
+                        let now_paused = !b.is_paused();
+                        b.toggle_pause();
+                        show_osd(if now_paused { "Paused" } else { "Playing" });
+                    }
+                    "mute" => {
+                        let now_muted = !b.is_muted();
+                        b.toggle_mute();
+                        show_osd(if now_muted { "Muted" } else { "Unmuted" });
+                    }
+                    "seek_back_small" => { b.seek_relative(-5.0); show_osd(&time_osd(pos - 5.0, dur)); }
+                    "seek_fwd_small" => { b.seek_relative(5.0); show_osd(&time_osd(pos + 5.0, dur)); }
+                    "seek_back_large" => { b.seek_relative(-10.0); show_osd(&time_osd(pos - 10.0, dur)); }
+                    "seek_fwd_large" => { b.seek_relative(10.0); show_osd(&time_osd(pos + 10.0, dur)); }
+                    "volume_up" => {
+                        let v = (b.volume() + 0.05).clamp(0.0, 1.0);
+                        b.set_volume(v);
+                        show_osd(&format!("Volume {}%", (v * 100.0).round() as i32));
+                    }
+                    "volume_down" => {
+                        let v = (b.volume() - 0.05).clamp(0.0, 1.0);
+                        b.set_volume(v);
+                        show_osd(&format!("Volume {}%", (v * 100.0).round() as i32));
+                    }
+                    "jump_start" => { b.seek_seconds(0.0); show_osd(&time_osd(0.0, dur)); }
+                    "jump_end" => {
+                        let t = (dur - 1.0).max(0.0);
+                        b.seek_seconds(t);
+                        show_osd(&time_osd(t, dur));
+                    }
+                    "next_track" => { b.playlist_next(); show_osd("Next"); }
+                    "prev_track" => { b.playlist_prev(); show_osd("Previous"); }
+                    _ => {}
+                }
             }
-        }
-        None
+        })
+    };
+    {
+        let bindings = bindings.clone();
+        let dispatch = dispatch.clone();
+        app.on_key_event(move |name| {
+            let name = name.to_string();
+            let idx = bindings.borrow().iter().position(|x| *x == name);
+            if let Some(idx) = idx {
+                dispatch(ACTIONS[idx].0);
+            }
+        });
     }
+
+    (shortcuts_model, rebuild_shortcuts)
 }
