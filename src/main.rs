@@ -62,10 +62,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Wayland app_id / X11 WM_CLASS → match io.github.alisp.Soniq.desktop.
             #[cfg(target_os = "linux")]
             let attrs = {
+                use slint::winit_030::winit::platform::startup_notify::WindowAttributesExtStartupNotify;
                 use slint::winit_030::winit::platform::wayland::WindowAttributesExtWayland;
                 use slint::winit_030::winit::platform::x11::WindowAttributesExtX11;
+                use slint::winit_030::winit::window::ActivationToken;
                 let attrs = WindowAttributesExtWayland::with_name(attrs, APP_ID, "");
-                WindowAttributesExtX11::with_name(attrs, APP_ID, "")
+                let attrs = WindowAttributesExtX11::with_name(attrs, APP_ID, "");
+                // Consume the launcher's startup-notification token so GNOME drops
+                // the "launching" busy cursor the moment our window maps — without
+                // this it spins until the ~20s startup-notify timeout. Strip it from
+                // the env so child processes (mpv, --new-window spawns) don't inherit
+                // a spent token.
+                let token = std::env::var("XDG_ACTIVATION_TOKEN")
+                    .ok()
+                    .or_else(|| std::env::var("DESKTOP_STARTUP_ID").ok());
+                if let Some(tok) = token {
+                    // SAFETY: single-threaded here (window not yet created).
+                    unsafe {
+                        std::env::remove_var("XDG_ACTIVATION_TOKEN");
+                        std::env::remove_var("DESKTOP_STARTUP_ID");
+                    }
+                    attrs.with_activation_token(ActivationToken::from_raw(tok))
+                } else {
+                    attrs
+                }
             };
             attrs
         })
