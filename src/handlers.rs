@@ -1322,6 +1322,10 @@ pub fn wire(app: &App, ctx: &Ctx) -> Rc<dyn Fn(bool)> {
             la.set(Instant::now());
             if let Some(a) = weak.upgrade() {
                 a.set_chrome_shown(true);
+                // Reveal the cursor immediately — the 250ms housekeeping tick
+                // would otherwise leave it hidden for a beat after the mouse moves.
+                use slint::winit_030::WinitWindowAccessor;
+                a.window().with_winit_window(|w| w.set_cursor_visible(true));
             }
         });
     }
@@ -1362,6 +1366,10 @@ pub fn housekeeping(app: &App, ctx: &Ctx) {
     let track_sig = RefCell::new(String::new());
     let queue_sig = RefCell::new(String::new());
     let last_size = Cell::new((0u32, 0u32));
+    // Mirror the chrome's visibility onto the OS cursor: when the bars fade out
+    // during playback the pointer must vanish with them (it floats over the
+    // video otherwise). Starts visible; deduped so we only poke winit on change.
+    let cursor_shown = Cell::new(true);
     {
         let bridge = bridge.clone();
         let store = store.clone();
@@ -1432,6 +1440,17 @@ pub fn housekeeping(app: &App, ctx: &Ctx) {
                     && last_activity.get().elapsed() > Duration::from_millis(2500)
                 {
                     a.set_chrome_shown(false);
+                }
+
+                // Keep the OS cursor in lock-step with the chrome. Reveal is
+                // also done instantly in on_pointer_activity so the cursor
+                // doesn't lag a tick behind the mouse; this catches the hide
+                // and any non-motion show (e.g. pause re-revealing the bars).
+                let want_cursor = a.get_chrome_shown();
+                if cursor_shown.get() != want_cursor {
+                    cursor_shown.set(want_cursor);
+                    use slint::winit_030::WinitWindowAccessor;
+                    a.window().with_winit_window(|w| w.set_cursor_visible(want_cursor));
                 }
 
                 let Some(b) = bridge.borrow().as_ref().map(|_| ()) else {
