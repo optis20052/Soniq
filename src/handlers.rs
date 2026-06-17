@@ -1420,11 +1420,15 @@ pub fn housekeeping(app: &App, ctx: &Ctx) {
                 a.set_win_square(square_now);
 
 
-                // auto-hide chrome
+                // auto-hide chrome — but never while the pointer is resting over
+                // the top bar or floating controls (the user is reaching for
+                // them; a still cursor fires no motion events, so without this
+                // the bar would vanish under their hand).
                 if a.get_has_video()
                     && !a.get_paused()
                     && !a.get_drawer_open()
                     && !a.get_url_open()
+                    && !a.get_chrome_hovered()
                     && last_activity.get().elapsed() > Duration::from_millis(2500)
                 {
                     a.set_chrome_shown(false);

@@ -348,11 +348,15 @@ component TopBar inherits Rectangle {
     // in instead of the scene out (fixed in video.rs::erase_corners_on).
     background: transparent;
 
+    // True while the pointer is anywhere over the bar — used to pin the chrome
+    // open (no auto-hide while the user is reaching for these controls).
+    out property <bool> hovering: tb-ta.has-hover;
+
     // Window-drag handle for the frameless window: covers the whole bar; the
     // buttons are later children so they stay clickable. Double-click maximizes.
     // Disabled while the chrome is faded out, so it can't eat the pointer
     // motion that reveals the chrome in the first place.
-    TouchArea {
+    tb-ta := TouchArea {
         enabled: root.fade > 0.1;
         pointer-event(e) => {
             if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
@@ -448,6 +452,10 @@ component ControlBar inherits Rectangle {
     callback hovered;
     // Per-leaf chrome fade — see IconButton.
     in property <float> fade: 1.0;
+    // True while the pointer is anywhere over the bar — used to pin the chrome
+    // open. `drag` is a full-bar TouchArea, and Slint hover is non-exclusive,
+    // so this stays true even while the pointer is over a child button/slider.
+    out property <bool> hovering: drag.has-hover;
 
     height: content.preferred-height;
     background: #1e1e22b8.transparentize(1 - root.fade);
@@ -1706,6 +1714,10 @@ export component App inherits Window {
     in property <bool> paused;
     in property <bool> muted;
     in property <bool> chrome-shown: true;
+    // True while the pointer rests over the top bar or the floating control
+    // bar. Read by the Rust auto-hide timer to keep the chrome pinned open as
+    // long as the user is hovering the controls — see housekeeping().
+    out property <bool> chrome-hovered: top-bar.hovering || (bar.visible && bar.hovering);
     // Animated chrome alpha. The leaves of the top/control bars bind to this
     // directly (colour alpha / image opacity) instead of an `opacity` on the
     // bars themselves: element-opacity over children renders via a Skia
@@ -2056,7 +2068,7 @@ export component App inherits Window {
             // Leaf element (no children): plain opacity doesn't layerize.
             opacity: root.chrome-fade;
         }
-        TopBar {
+        top-bar := TopBar {
             // Always shown: on the frameless Linux window this bar is the only
             // place to minimize/maximize/close and reach settings, so the home
             // screen needs it too (over video it fades with the rest of the
