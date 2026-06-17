@@ -203,8 +203,17 @@ component Slider inherits Rectangle {
     callback changed(float);
     callback committed(float);   // fires once when the drag is released
 
+    // Map a pointer x to a 0..1 value. The knob's center travels from knob/2
+    // (far left) to width-knob/2 (far right) — see its `x` binding below — so a
+    // plain mouse-x/width would only line up at the midpoint and drift toward
+    // center at the ends. Invert the knob's placement so its center always sits
+    // exactly under the cursor.
+    pure function x-to-value(mx: length) -> float {
+        return Math.clamp((mx - root.knob / 2) / (root.width - root.knob), 0, 1);
+    }
+
     // time at the hovered x, formatted M:SS / H:MM:SS
-    property <float> hover-frac: Math.clamp(ta.mouse-x / root.width, 0, 1);
+    property <float> hover-frac: root.x-to-value(ta.mouse-x);
     property <int> hover-secs: Math.round(root.hover-frac * root.duration);
     property <int> hov-h: Math.floor(root.hover-secs / 3600);
     property <int> hov-m: Math.mod(Math.floor(root.hover-secs / 60), 60);
@@ -281,7 +290,7 @@ component Slider inherits Rectangle {
         pointer-event(e) => {
             if (e.kind == PointerEventKind.down) {
                 root.settling = false;
-                root.drag-value = Math.clamp(self.mouse-x / root.width, 0, 1);
+                root.drag-value = root.x-to-value(self.mouse-x);
                 root.changed(root.drag-value);
             } else if (e.kind == PointerEventKind.up) {
                 root.release-value = root.drag-value;
@@ -291,7 +300,7 @@ component Slider inherits Rectangle {
         }
         moved => {
             if (self.pressed) {
-                root.drag-value = Math.clamp(self.mouse-x / root.width, 0, 1);
+                root.drag-value = root.x-to-value(self.mouse-x);
                 root.changed(root.drag-value);
             }
         }
