@@ -64,7 +64,10 @@ pub fn install(app: &App, deps: PrefsDeps) {
         app.on_open_prefs(move || {
             if prefs.borrow().is_none() {
                 if let Ok(w) = PrefsWindow::new() {
-w.set_shortcuts(ModelRc::from(shortcuts_model.clone()));
+                    // macOS gives this window a native fullsize-content titlebar
+                    // too; inset the sidebar header clear of the traffic lights.
+                    w.set_mac_native(cfg!(target_os = "macos"));
+                    w.set_shortcuts(ModelRc::from(shortcuts_model.clone()));
                     {
                         let bindings = bindings.clone();
                         let rebuild = rebuild_shortcuts.clone();

@@ -2636,6 +2636,10 @@ export component PrefsWindow inherits Window {
     min-height: 480px;
     background: #16161a;
     forward-focus: cap;
+    // True on macOS: this window also gets the native fullsize-content titlebar
+    // (traffic lights overlay the top-left), so the sidebar header is inset
+    // below them.
+    in property <bool> mac-native: false;
 
     // Close any open dropdown/picker when the window resizes (a PopupWindow is
     // anchored at show-time and otherwise detaches to stale coordinates).
@@ -2650,6 +2654,8 @@ export component PrefsWindow inherits Window {
                 root.capturing-index = -1;
                 return accept;
             }
+            // Esc closes the window (like the main window's Escape handling).
+            if (e.text == Key.Escape) { root.close-prefs(); return accept; }
             return reject;
         }
 
@@ -2662,6 +2668,9 @@ export component PrefsWindow inherits Window {
                 Rectangle { x: parent.width - 1px; width: 1px; background: #ffffff14; }
                 VerticalLayout {
                     padding: 16px;
+                    // On macOS push everything below the traffic lights (the
+                    // native titlebar overlays this corner).
+                    padding-top: root.mac-native ? 36px : 16px;
                     spacing: 4px;
                     // branding header
                     HorizontalLayout {
