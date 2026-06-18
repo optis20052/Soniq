@@ -337,6 +337,15 @@ component TopBar inherits Rectangle {
     callback drag;
     // Hidden when the OS provides native window buttons (macOS traffic lights).
     in property <bool> window-controls: true;
+    // True on macOS: the native traffic-light buttons own the top-left, so the
+    // leading open/link icons move over to the right cluster instead of
+    // crowding into that same row.
+    in property <bool> mac-native: false;
+    // Icon button sizing. macOS centres these on the high traffic-light line, so
+    // a slightly smaller circle keeps top padding instead of clipping the window
+    // edge (the lights are tiny, so a full-size 30px circle there looks crammed).
+    in property <length> icon-box: 30px;
+    in property <length> icon-glyph: 18px;
     // Per-leaf chrome fade — see IconButton.
     in property <float> fade: 1.0;
 
@@ -366,13 +375,23 @@ component TopBar inherits Rectangle {
         double-clicked => { root.maximize(); }
     }
 
+    // The IconButtons stretch to this layout's height and centre their circle
+    // in it. On macOS the traffic lights are centred in the ~28px titlebar
+    // (≈14px from the top), so constrain this row to that band at the very top
+    // to put our icons on the same line. Linux fills the whole bar as before.
+    // Full-size icons, vertically centred in the bar. On macOS they sit a little
+    // below the (untouched) traffic lights — we don't move the system buttons,
+    // and full-size icons can't align with the small high lights without
+    // crowding the top edge, so they just live as a comfortable right-side row.
     HorizontalLayout {
         padding-left: 10px;
-        padding-right: 10px;
+        padding-right: root.mac-native ? 12px : 10px;
         padding-top: 8px;
         spacing: 6px;
 
-        HorizontalLayout {
+        // Leading open/link icons — top-left on Linux. On macOS the traffic
+        // lights live here, so these move to the right cluster (below) instead.
+        if !root.mac-native: HorizontalLayout {
             spacing: 2px;
             alignment: start;
             IconButton {
@@ -386,23 +405,31 @@ component TopBar inherits Rectangle {
                 clicked => { root.open-url(); }
             }
         }
-        Rectangle {
-            horizontal-stretch: 1;
-            Text {
-                text: root.title-text;
-                color: #fffffff2.transparentize(1 - root.fade);
-                font-size: 14px;
-                font-weight: 600;
-                overflow: elide;
-                width: parent.width;
-                horizontal-alignment: center;
-            }
-        }
+        // Spacer only — the title is a true-centred overlay (below), so it
+        // stays dead-centre even when the side groups are asymmetric (macOS).
+        Rectangle { horizontal-stretch: 1; }
         HorizontalLayout {
             spacing: 2px;
             alignment: end;
+            // On macOS the open/link icons live here, clear of the traffic lights.
+            if root.mac-native: IconButton {
+                icon: @image-url("icons/open.svg");
+                box: root.icon-box;
+                glyph: root.icon-glyph;
+                fade: root.fade;
+                clicked => { root.open-file(); }
+            }
+            if root.mac-native: IconButton {
+                icon: @image-url("icons/link.svg");
+                box: root.icon-box;
+                glyph: root.icon-glyph;
+                fade: root.fade;
+                clicked => { root.open-url(); }
+            }
             IconButton {
                 icon: @image-url("icons/gear.svg");
+                box: root.icon-box;
+                glyph: root.icon-glyph;
                 fade: root.fade;
                 clicked => { root.settings(); }
             }
@@ -423,6 +450,29 @@ component TopBar inherits Rectangle {
                 clicked => { root.close(); }
             }
         }
+    }
+
+    // True-centred title across the FULL bar width, independent of the side
+    // icon groups. On macOS the left group is inset past the traffic lights and
+    // the right group is just the gear (native window buttons take over), so
+    // centring inside the gap between them would render the title off-centre.
+    // Width is reserved symmetrically so the text never runs under either group.
+    // (No TouchArea, so it's transparent to hit-testing — icons stay clickable.)
+    Text {
+        x: (parent.width - self.width) / 2;
+        y: 0;
+        // Centred in the full bar — matches the icon row's vertical centre.
+        height: parent.height;
+        // Reserve room each side for the icon clusters so a long title elides
+        // instead of sliding under them; stays symmetric → dead-centre.
+        width: Math.max(0px, parent.width - 300px);
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        text: root.title-text;
+        color: #fffffff2.transparentize(1 - root.fade);
+        font-size: 14px;
+        font-weight: 600;
+        overflow: elide;
     }
 }
 
@@ -1829,13 +1879,21 @@ export component App inherits Window {
     // surface and a clipped layer, and on this stack the GL surface has no
     // working alpha (corners render black) and clip breaks descendant
     // drop-shadows (they paint as solid black boxes).
-    no-frame: true;
+    // Frameless everywhere EXCEPT macOS: there we want a native titled window
+    // (traffic-light buttons + OS-rounded corners). Slint re-applies
+    // `set_decorations(!no_frame)` on every property pass, so a literal `true`
+    // here would strip the native titlebar our winit attributes hook set up.
+    // Binding it to `!mac-native` keeps Slint's call a no-op on macOS.
+    no-frame: !root.mac-native;
     // Always clear opaque black — corner transparency is carved into the alpha
     // channel by punch_window_corners() AFTER Skia renders. Clearing with
     // `transparent` made Skia composite the fading panels over an alpha-0
     // background (premultiply bug → RGB flashes = "screen blinks on fades",
     // invisible in opaque mode only because the same math landed on black).
     in property <bool> alpha-surface: false;
+    // True on macOS, where the OS draws native traffic-light buttons over our
+    // chrome's top-left corner — used to inset that chrome clear of them.
+    in property <bool> mac-native: false;
     background: #000000;
     forward-focus: keys;
 
@@ -2079,6 +2137,10 @@ export component App inherits Window {
             // legibility shade.
             // native decorations (macOS) provide their own window buttons
             window-controls: root.alpha-surface;
+            mac-native: root.mac-native;
+            // Full-size icons on both platforms.
+            icon-box: 30px;
+            icon-glyph: 18px;
             title-text: root.title-text;
             fade: root.chrome-fade;
             open-file => { root.open-file(); }

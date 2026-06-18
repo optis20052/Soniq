@@ -58,7 +58,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_winit_window_attributes_hook(move |attrs| {
             let attrs = attrs.with_transparent(!force_opaque);
             // The hook runs after Slint's own attributes — overrides `no-frame`.
-            let attrs = if native_decor { attrs.with_decorations(true) } else { attrs };
+            // macOS: make it a NATIVE titled window so we get the traffic-light
+            // buttons and OS-rounded corners, but keep a transparent, full-size
+            // content titlebar so our own chrome draws edge-to-edge underneath it
+            // (and hide the native title — we render our own centered one).
+            // `no-frame`/decorations alone don't produce the traffic lights.
+            #[cfg(target_os = "macos")]
+            let attrs = {
+                use slint::winit_030::winit::platform::macos::WindowAttributesExtMacOS;
+                let _ = native_decor;
+                attrs
+                    .with_decorations(true)
+                    .with_titlebar_transparent(true)
+                    .with_fullsize_content_view(true)
+                    .with_title_hidden(true)
+            };
             // Wayland app_id / X11 WM_CLASS → match io.github.alisp.Soniq.desktop.
             #[cfg(target_os = "linux")]
             let attrs = {
@@ -93,6 +107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = App::new()?;
     app.set_alpha_surface(!force_opaque);
+    // Inset our top-left chrome past the macOS traffic-light buttons.
+    app.set_mac_native(cfg!(target_os = "macos"));
     // Set the probed size before the window is shown so it never resizes.
     if let Some((w, h)) = initial_size {
         app.window().set_size(slint::LogicalSize::new(w, h));

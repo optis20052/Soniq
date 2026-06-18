@@ -215,7 +215,19 @@ impl VideoBridge {
         );
         // hwdec is overridable for diagnosis (e.g. SONIQ_HWDEC=no forces software
         // decode, isolating GPU-decode/interop bugs from the compositing path).
-        let hwdec = std::env::var("SONIQ_HWDEC").unwrap_or_else(|_| "auto-safe".into());
+        //
+        // macOS: VideoToolbox's zero-copy GL interop (what `auto-safe` picks)
+        // doesn't bind the frame's chroma plane through our embedded Skia GL
+        // context, so CbCr reads as 0 and the whole video comes out green. Use
+        // the `-copy` variant instead: still hardware-decoded, but the frame is
+        // read back to system memory and mpv does the YUV→RGB upload itself, so
+        // no broken plane interop. On Linux `auto-safe` (VAAPI/NVDEC) is fine.
+        let default_hwdec = if cfg!(target_os = "macos") {
+            "videotoolbox-copy"
+        } else {
+            "auto-safe"
+        };
+        let hwdec = std::env::var("SONIQ_HWDEC").unwrap_or_else(|_| default_hwdec.into());
         let _ = mpv.set_property("hwdec", hwdec.as_str());
         // Tell mpv our render target is 8-bit SDR (BT.709). With the libmpv
         // render API there's no display to probe, so without this mpv leaves HDR
