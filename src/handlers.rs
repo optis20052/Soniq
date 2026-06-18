@@ -45,6 +45,8 @@ pub struct Ctx {
     pub mouse_double: Rc<Cell<i32>>,
     pub mouse_right: Rc<Cell<i32>>,
     pub sub_style: Rc<RefCell<SubStyle>>,
+    pub cache_fwd: Rc<Cell<i64>>,
+    pub cache_back: Rc<Cell<i64>>,
     pub font_families: Rc<Vec<String>>,
     pub bindings: Rc<RefCell<Vec<String>>>,
     pub persist: Rc<dyn Fn()>,
@@ -80,6 +82,8 @@ impl Ctx {
             saved_volume: self.saved_volume,
             saved_muted: self.saved_muted,
             saved_sub_style: self.saved_sub_style.clone(),
+            saved_cache_fwd: self.cache_fwd.get(),
+            saved_cache_back: self.cache_back.get(),
         }
     }
 }
@@ -126,6 +130,11 @@ pub fn build(app: &App) -> Ctx {
     // Right click defaults to Play / Pause (action index 1).
     let mouse_right = Rc::new(Cell::new(cfg.mouse_right.unwrap_or(1)));
     let sub_style = Rc::new(RefCell::new(cfg.sub_style.clone().unwrap_or_default()));
+    // Demuxer cache window (MiB), user-tunable in Prefs. Defaults 64 ahead /
+    // 32 behind — generous enough for smooth streaming and recent-seek scrubbing
+    // without the old 256/256 (≈512MiB) RAM hoard.
+    let cache_fwd = Rc::new(Cell::new(cfg.cache_fwd_mib.unwrap_or(64)));
+    let cache_back = Rc::new(Cell::new(cfg.cache_back_mib.unwrap_or(32)));
     // All installed font families (for the subtitle font picker), enumerated
     // once at startup; the prefs window filters this list as the user types.
     let font_families = Rc::new(system_font_families());
@@ -155,6 +164,8 @@ pub fn build(app: &App) -> Ctx {
         let mouse_double = mouse_double.clone();
         let mouse_right = mouse_right.clone();
         let sub_style = sub_style.clone();
+        let cache_fwd = cache_fwd.clone();
+        let cache_back = cache_back.clone();
         let weak = app.as_weak();
         Rc::new(move || {
             let shortcuts: HashMap<String, String> = ACTIONS
@@ -176,6 +187,8 @@ pub fn build(app: &App) -> Ctx {
                 mouse_right: Some(mouse_right.get()),
                 show_fps: None,
                 sub_style: Some(sub_style.borrow().clone()),
+                cache_fwd_mib: Some(cache_fwd.get()),
+                cache_back_mib: Some(cache_back.get()),
             }
             .save();
         })
@@ -392,6 +405,8 @@ pub fn build(app: &App) -> Ctx {
         mouse_double,
         mouse_right,
         sub_style,
+        cache_fwd,
+        cache_back,
         font_families,
         bindings,
         persist,
@@ -426,6 +441,8 @@ pub fn wire(app: &App, ctx: &Ctx) -> Rc<dyn Fn(bool)> {
     let mouse_double = ctx.mouse_double.clone();
     let mouse_right = ctx.mouse_right.clone();
     let sub_style = ctx.sub_style.clone();
+    let cache_fwd = ctx.cache_fwd.clone();
+    let cache_back = ctx.cache_back.clone();
     let font_families = ctx.font_families.clone();
     let bindings = ctx.bindings.clone();
     let persist = ctx.persist.clone();
@@ -1113,6 +1130,8 @@ pub fn wire(app: &App, ctx: &Ctx) -> Rc<dyn Fn(bool)> {
         mouse_double: mouse_double.clone(),
         mouse_right: mouse_right.clone(),
         sub_style: sub_style.clone(),
+        cache_fwd: cache_fwd.clone(),
+        cache_back: cache_back.clone(),
         font_families: font_families.clone(),
     });
 

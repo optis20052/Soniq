@@ -971,8 +971,11 @@ component SliderRow inherits VerticalLayout {
     in property <int> decimals: 2;
     in property <string> unit: "";
     in property <bool> enabled: true;
+    // Initial value — defaults to default-val, but persisted sliders set it from
+    // saved config so they open reflecting the stored value (not the default).
+    in property <float> init-val: root.default-val;
     callback changed(float);
-    property <float> val: default-val;
+    property <float> val: root.init-val;
     padding-left: 16px; padding-right: 16px; padding-top: 12px; padding-bottom: 12px;
     spacing: 6px;
     opacity: root.enabled ? 1.0 : 0.4;
@@ -2589,6 +2592,8 @@ export component PrefsWindow inherits Window {
     in property <[ShortcutItem]> shortcuts;
     callback adjust(string, float);
     callback set-resume(int);
+    callback set-buffer-ahead(float);
+    callback set-buffer-behind(float);
     callback set-mouse-single(int);
     callback set-mouse-double(int);
     callback set-mouse-right(int);
@@ -2617,6 +2622,8 @@ export component PrefsWindow inherits Window {
     // Saved settings, pushed in from Rust so the controls open reflecting the
     // persisted config rather than hard-coded defaults.
     in property <int> init-resume: 1;
+    in property <float> init-cache-fwd: 64;
+    in property <float> init-cache-back: 32;
     in property <int> init-mouse-single: 2;
     in property <int> init-mouse-double: 3;
     in property <int> init-mouse-right: 1;
@@ -2764,6 +2771,22 @@ export component PrefsWindow inherits Window {
                         GroupCard {
                             title: "Playback";
                             ComboRow { title: "Resume playback"; options: ["Off", "Ask each time", "Always resume"]; current: root.init-resume; changed(i) => { root.set-resume(i); } }
+                        }
+                        GroupCard {
+                            title: "Network buffering";
+                            SliderRow {
+                                title: "Buffer ahead";
+                                min: 16; max: 512; default-val: 64; init-val: root.init-cache-fwd;
+                                decimals: 0; unit: " MiB";
+                                changed(v) => { root.set-buffer-ahead(v); }
+                            }
+                            RowSep {}
+                            SliderRow {
+                                title: "Buffer behind (instant rewind)";
+                                min: 8; max: 256; default-val: 32; init-val: root.init-cache-back;
+                                decimals: 0; unit: " MiB";
+                                changed(v) => { root.set-buffer-behind(v); }
+                            }
                         }
                     }
 

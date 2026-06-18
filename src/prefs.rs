@@ -26,6 +26,8 @@ pub struct PrefsDeps {
     pub mouse_double: Rc<Cell<i32>>,
     pub mouse_right: Rc<Cell<i32>>,
     pub sub_style: Rc<RefCell<SubStyle>>,
+    pub cache_fwd: Rc<Cell<i64>>,
+    pub cache_back: Rc<Cell<i64>>,
     pub font_families: Rc<Vec<String>>,
 }
 
@@ -43,6 +45,8 @@ pub fn install(app: &App, deps: PrefsDeps) {
         mouse_double,
         mouse_right,
         sub_style,
+        cache_fwd,
+        cache_back,
         font_families,
     } = deps;
 
@@ -188,6 +192,8 @@ pub fn install(app: &App, deps: PrefsDeps) {
                             // (title, category, page index)
                             const SETTINGS: &[(&str, &str, i32)] = &[
                                 ("Resume playback", "General · Playback", 0),
+                                ("Buffer ahead", "General · Network buffering", 0),
+                                ("Buffer behind", "General · Network buffering", 0),
                                 ("Show network stats", "Developer", 4),
                                 ("Show FPS", "Developer", 4),
                                 ("Keyboard shortcuts", "Shortcuts", 1),
@@ -355,8 +361,37 @@ pub fn install(app: &App, deps: PrefsDeps) {
                             persist();
                         });
                     }
+                    // Demuxer cache sliders — apply live to mpv and persist.
+                    {
+                        let bridge = bridge.clone();
+                        let cache_fwd = cache_fwd.clone();
+                        let cache_back = cache_back.clone();
+                        let persist = persist.clone();
+                        w.on_set_buffer_ahead(move |mib| {
+                            cache_fwd.set(mib.round() as i64);
+                            if let Some(b) = bridge.borrow().as_ref() {
+                                b.set_cache_limits(cache_fwd.get(), cache_back.get());
+                            }
+                            persist();
+                        });
+                    }
+                    {
+                        let bridge = bridge.clone();
+                        let cache_fwd = cache_fwd.clone();
+                        let cache_back = cache_back.clone();
+                        let persist = persist.clone();
+                        w.on_set_buffer_behind(move |mib| {
+                            cache_back.set(mib.round() as i64);
+                            if let Some(b) = bridge.borrow().as_ref() {
+                                b.set_cache_limits(cache_fwd.get(), cache_back.get());
+                            }
+                            persist();
+                        });
+                    }
                     // Reflect the saved settings in the freshly-built prefs UI.
                     w.set_init_resume(resume_mode.get().to_index());
+                    w.set_init_cache_fwd(cache_fwd.get() as f32);
+                    w.set_init_cache_back(cache_back.get() as f32);
                     w.set_init_mouse_single(mouse_single.get());
                     w.set_init_mouse_double(mouse_double.get());
                     w.set_init_mouse_right(mouse_right.get());

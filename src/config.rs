@@ -141,6 +141,10 @@ pub struct Config {
     pub mouse_right: Option<i32>,
     pub show_fps: Option<bool>,
     pub sub_style: Option<SubStyle>,
+    /// Demuxer cache window (MiB): how much to buffer ahead / keep behind for
+    /// instant rewind. Defaults 64 / 32 (see handlers). User-tunable in Prefs.
+    pub cache_fwd_mib: Option<i64>,
+    pub cache_back_mib: Option<i64>,
 }
 
 fn config_path() -> Option<PathBuf> {

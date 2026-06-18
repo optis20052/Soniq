@@ -34,6 +34,8 @@ pub struct RenderDeps {
     pub saved_volume: f64,
     pub saved_muted: bool,
     pub saved_sub_style: SubStyle,
+    pub saved_cache_fwd: i64,
+    pub saved_cache_back: i64,
 }
 
 /// Install the rendering notifier + redraw heartbeat on the app window.
@@ -53,6 +55,8 @@ pub fn install(app: &App, deps: RenderDeps) {
         saved_volume,
         saved_muted,
         saved_sub_style,
+        saved_cache_fwd,
+        saved_cache_back,
     } = deps;
 
     let weak = app.as_weak();
@@ -99,6 +103,7 @@ pub fn install(app: &App, deps: RenderDeps) {
                     if saved_muted {
                         b.toggle_mute();
                     }
+                    b.set_cache_limits(saved_cache_fwd, saved_cache_back);
                     apply_sub_style(&b, &saved_sub_style);
                     *bridge_rn.borrow_mut() = Some(b);
                     // GTK-style opaque region: body opaque, corners blended.

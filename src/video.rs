@@ -252,13 +252,19 @@ impl VideoBridge {
         // frame's display time — otherwise slider drags and UI animations stall.
         // We drive redraws ourselves at ~60fps and just render the current frame.
         let _ = mpv.set_property("video-timing-offset", 0.0);
-        // Snappy scrubbing: keep a generous demuxer cache so exact seeks resolve
-        // from memory instead of re-reading/re-demuxing from disk each time (this
-        // is a big part of why the GStreamer build felt instant), and enable
+        // Demuxer cache sized for snappy scrubbing without hoarding RAM. The old
+        // 256MiB forward + 256MiB back (≈512MiB, with cache=yes forcing it even
+        // for local files) is what made us use far more memory than IINA on the
+        // same stream. 64MiB ahead / 32MiB back keeps recent seeks resolving from
+        // memory while cutting peak cache ~5×; `cache=auto` lets mpv skip the RAM
+        // cache entirely for local files (disk re-reads are cheap on SSD). Env
+        // override for power users who want the old hoard-everything behaviour.
+        let _ = mpv.set_property("cache", "auto");
+        let fwd = std::env::var("SONIQ_CACHE_FWD").unwrap_or_else(|_| "64MiB".into());
+        let back = std::env::var("SONIQ_CACHE_BACK").unwrap_or_else(|_| "32MiB".into());
+        let _ = mpv.set_property("demuxer-max-bytes", fwd.as_str());
+        let _ = mpv.set_property("demuxer-max-back-bytes", back.as_str());
         // hr-seek so exact seeks are precise even on sparse-keyframe content.
-        let _ = mpv.set_property("cache", "yes");
-        let _ = mpv.set_property("demuxer-max-bytes", "256MiB");
-        let _ = mpv.set_property("demuxer-max-back-bytes", "256MiB");
         let _ = mpv.set_property("hr-seek", "yes");
         let _ = mpv.set_property("hr-seek-framedrop", "yes");
 
@@ -548,6 +554,18 @@ impl VideoBridge {
     }
     pub fn set_hwdec(&self, on: bool) {
         let _ = self.mpv.set_property("hwdec", if on { "auto-safe" } else { "no" });
+    }
+    /// Resize the demuxer cache window (MiB) live — the Prefs sliders call this so
+    /// changes take effect without a reload. `SONIQ_CACHE_FWD`/`SONIQ_CACHE_BACK`
+    /// env vars still override (debugging). `fwd` is the read-ahead buffer; `back`
+    /// is how much already-played data is kept for instant rewind.
+    pub fn set_cache_limits(&self, fwd_mib: i64, back_mib: i64) {
+        let fwd =
+            std::env::var("SONIQ_CACHE_FWD").unwrap_or_else(|_| format!("{}MiB", fwd_mib.max(8)));
+        let back =
+            std::env::var("SONIQ_CACHE_BACK").unwrap_or_else(|_| format!("{}MiB", back_mib.max(0)));
+        let _ = self.mpv.set_property("demuxer-max-bytes", fwd.as_str());
+        let _ = self.mpv.set_property("demuxer-max-back-bytes", back.as_str());
     }
     pub fn set_deinterlace(&self, on: bool) {
         let _ = self.mpv.set_property("deinterlace", on);
