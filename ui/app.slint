@@ -985,7 +985,13 @@ component SliderRow inherits VerticalLayout {
         }
         Rectangle { width: 22px; height: 22px; border-radius: 11px;
             background: rta.has-hover ? #ffffff1f : transparent;
-            Text { text: "⟲"; color: #ffffff8c; font-size: 13px; }
+            // SVG (not a glyph): the ⟲ codepoint is missing in macOS's default font.
+            Image {
+                width: 14px; height: 14px;
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                source: @image-url("icons/reset.svg");
+                opacity: rta.has-hover ? 0.85 : 0.55;
+            }
             rta := TouchArea { enabled: root.enabled; clicked => { root.val = root.default-val; root.changed(root.val); } }
         }
     }
@@ -1501,7 +1507,12 @@ component UrlDialog inherits Rectangle {
                                     width: 24px; height: 24px; border-radius: 12px;
                                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                                     background: xa.has-hover ? #e8433ed9 : transparent;
-                                    Text { text: "✕"; color: xa.has-hover ? #ffffff : #ffffff73; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                    Image {
+                                        width: 11px; height: 11px;
+                                        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                        source: @image-url("icons/close.svg");
+                                        opacity: xa.has-hover ? 1.0 : 0.45;
+                                    }
                                     xa := TouchArea { clicked => { root.remove-url(i); } }
                                 }
                             }
@@ -1584,11 +1595,12 @@ component RecentRow inherits Rectangle {
             border-radius: 15px;
             background: xa.has-hover ? #e8433ed9 : transparent;
             animate background { duration: 100ms; }
-            Text {
-                text: "✕";
-                color: xa.has-hover ? #ffffff : #ffffff66;
-                font-size: 13px;
-                horizontal-alignment: center; vertical-alignment: center;
+            // SVG (not a glyph): the ✕ codepoint is missing in macOS's default font.
+            Image {
+                width: 12px; height: 12px;
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                source: @image-url("icons/close.svg");
+                opacity: xa.has-hover ? 1.0 : 0.4;
             }
             xa := TouchArea { clicked => { root.remove(); } }
         }
@@ -2105,7 +2117,12 @@ export component App inherits Window {
                                 border-color: #ffffff73;
                                 background: rbanner.always ? #3584e4 : transparent;
                                 animate background { duration: 100ms; }
-                                Text { text: "✓"; visible: rbanner.always; color: #ffffff; font-size: 12px; font-weight: 700; }
+                                Image {
+                                    width: 12px; height: 12px;
+                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                    visible: rbanner.always;
+                                    source: @image-url("icons/check.svg");
+                                }
                             }
                         }
                         Text { text: "Always resume"; color: #ffffffd9; font-size: 14px; vertical-alignment: center; }
@@ -2548,7 +2565,12 @@ component PrefSearchField inherits Rectangle {
                 width: 22px; height: 22px; border-radius: 11px;
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 background: xa.has-hover ? #ffffff24 : #ffffff14;
-                Text { text: "✕"; color: #ffffffcc; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                Image {
+                    width: 11px; height: 11px;
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                    source: @image-url("icons/close.svg");
+                    opacity: 0.8;
+                }
                 xa := TouchArea { clicked => { root.clear(); } }
             }
         }
