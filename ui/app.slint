@@ -930,10 +930,16 @@ component FontPickerRow inherits Rectangle {
                             border-radius: 7px;
                             border-width: 1px;
                             border-color: sin.has-focus ? #4593f0 : #ffffff1f;
+                            clip: true;
                             HorizontalLayout {
                                 padding-left: 10px; padding-right: 10px; spacing: 6px;
                                 Text { text: "🔍"; font-size: 12px; color: #ffffff8c; vertical-alignment: center; }
                                 sin := TextInput {
+                                    // Constrain width so long input scrolls inside
+                                    // the box instead of overflowing it (matches
+                                    // PrefSearchField). min-width:0 lets it shrink.
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
                                     color: #ffffff; font-size: 13px; vertical-alignment: center;
                                     single-line: true;
                                     edited => { root.search(self.text); }
