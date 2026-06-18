@@ -188,8 +188,8 @@ pub fn install(app: &App, deps: PrefsDeps) {
                             // (title, category, page index)
                             const SETTINGS: &[(&str, &str, i32)] = &[
                                 ("Resume playback", "General · Playback", 0),
-                                ("Show network stats", "General · Developer", 0),
-                                ("Show FPS", "General · Developer", 0),
+                                ("Show network stats", "Developer", 4),
+                                ("Show FPS", "Developer", 4),
                                 ("Keyboard shortcuts", "Shortcuts", 1),
                                 ("Subtitle font", "Subtitles · Font", 2),
                                 ("Subtitle size", "Subtitles · Font", 2),

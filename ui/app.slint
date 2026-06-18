@@ -2688,6 +2688,11 @@ export component PrefsWindow inherits Window {
                     DrawerTab { label: "Shortcuts"; has-icon: true; icon: @image-url("icons/tab-keyboard.svg"); active: root.page == 1 && !root.searching; clicked => { search-field.clear(); root.page = 1; } }
                     DrawerTab { label: "Subtitles"; has-icon: true; icon: @image-url("icons/subtitles.svg"); active: root.page == 2 && !root.searching; clicked => { search-field.clear(); root.page = 2; } }
                     DrawerTab { label: "Mouse"; has-icon: true; icon: @image-url("icons/tab-mouse.svg"); active: root.page == 3 && !root.searching; clicked => { search-field.clear(); root.page = 3; } }
+                    // Advanced/developer settings, set apart from the main tabs.
+                    Rectangle { height: 8px; }
+                    Rectangle { height: 1px; background: #ffffff12; }
+                    Rectangle { height: 8px; }
+                    DrawerTab { label: "Developer"; has-icon: true; icon: @image-url("icons/gear.svg"); active: root.page == 4 && !root.searching; clicked => { search-field.clear(); root.page = 4; } }
                     Rectangle { vertical-stretch: 1; }
                     Pill { label: "Close"; primary: true; clicked => { root.close-prefs(); } }
                 }
@@ -2738,6 +2743,11 @@ export component PrefsWindow inherits Window {
                             title: "Playback";
                             ComboRow { title: "Resume playback"; options: ["Off", "Ask each time", "Always resume"]; current: root.init-resume; changed(i) => { root.set-resume(i); } }
                         }
+                    }
+
+                    // ===== Developer =====
+                    if root.page == 4 && !root.searching: VerticalLayout {
+                        spacing: 16px;
                         GroupCard {
                             title: "Developer";
                             SwitchRow { title: "Show network stats"; toggled(v) => { root.toggle-netstats(v); } }
