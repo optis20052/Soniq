@@ -202,6 +202,11 @@ component Slider inherits Rectangle {
     in property <float> duration: 0;
     callback changed(float);
     callback committed(float);   // fires once when the drag is released
+    // True while the pointer is over the slider. The bar's full-width `drag`
+    // TouchArea sits *behind* this one, so its has-hover drops out while the
+    // pointer rests on the slider/knob — the chrome would then auto-hide under a
+    // still cursor reading the seek tooltip. ControlBar ORs this back in.
+    out property <bool> hovering: ta.has-hover;
 
     // Map a pointer x to a 0..1 value. The knob's center travels from knob/2
     // (far left) to width-knob/2 (far right) — see its `x` binding below — so a
@@ -503,9 +508,12 @@ component ControlBar inherits Rectangle {
     // Per-leaf chrome fade — see IconButton.
     in property <float> fade: 1.0;
     // True while the pointer is anywhere over the bar — used to pin the chrome
-    // open. `drag` is a full-bar TouchArea, and Slint hover is non-exclusive,
-    // so this stays true even while the pointer is over a child button/slider.
-    out property <bool> hovering: drag.has-hover;
+    // open. `drag` is a full-bar TouchArea sitting behind the controls; its
+    // has-hover covers the bar background, but a child TouchArea on top steals
+    // the hover while the pointer rests on it. OR in the sliders (the one place
+    // the cursor naturally sits still — reading the seek tooltip) so the chrome
+    // stays pinned there too.
+    out property <bool> hovering: drag.has-hover || vol-slider.hovering || seek-slider.hovering;
 
     height: content.preferred-height;
     background: #1e1e22b8.transparentize(1 - root.fade);
@@ -555,7 +563,7 @@ component ControlBar inherits Rectangle {
                         drag-by(dx, dy) => { root.moved-by(dx, dy); }
                         }
                     }
-                    Slider {
+                    vol-slider := Slider {
                         fade: root.fade;
                         width: 96px;
                         accent: #3584e4;
@@ -645,7 +653,7 @@ component ControlBar inherits Rectangle {
                 horizontal-alignment: left;
                 min-width: 38px;
             }
-            Slider {
+            seek-slider := Slider {
                 fade: root.fade;
                 value: root.progress;
                 secondary: root.buffered;
@@ -1148,6 +1156,7 @@ component Drawer inherits Rectangle {
     in property <[TrackUi]> video-tracks;
     in property <[TrackUi]> audio-tracks;
     in property <[TrackUi]> sub-tracks;
+    in property <float> init-sub-font-size: 55;
     callback select-video(int);
     callback select-audio(int);
     callback select-sub(int);
@@ -1264,8 +1273,16 @@ component Drawer inherits Rectangle {
                     spacing: 14px;
                     GroupCard {
                         title: "Subtitle track";
-                        TrackRow { label: "Off"; clicked => { root.select-sub(-1); } }
-                        for t in root.sub-tracks: TrackRow { label: t.label; selected: t.selected; clicked => { root.select-sub(t.id); } }
+                        // Cap the track list height so a track with many
+                        // languages doesn't make the whole panel scroll forever —
+                        // the list scrolls internally instead.
+                        Flickable {
+                            height: 228px;
+                            VerticalLayout {
+                                TrackRow { label: "Off"; clicked => { root.select-sub(-1); } }
+                                for t in root.sub-tracks: TrackRow { label: t.label; selected: t.selected; clicked => { root.select-sub(t.id); } }
+                            }
+                        }
                         // Adwaita-style action row — a full-width Pill looked
                         // like a giant lozenge wedged into the group card.
                         Rectangle {
@@ -1285,7 +1302,7 @@ component Drawer inherits Rectangle {
                         title: "Timing & position";
                         SliderRow { title: "Delay (s)"; min: -10; max: 10; default-val: 0; decimals: 1; changed(v) => { root.adjust("sub-delay", v); } }
                         SliderRow { title: "Position"; min: 0; max: 150; default-val: 100; decimals: 0; changed(v) => { root.adjust("sub-pos", v); } }
-                        SliderRow { title: "Scale"; min: 0.5; max: 3; default-val: 1; changed(v) => { root.adjust("sub-scale", v); } }
+                        SliderRow { title: "Size"; min: 20; max: 120; default-val: root.init-sub-font-size; decimals: 0; changed(v) => { root.adjust("sub-font-size", v); } }
                     }
                     GroupCard {
                         title: "Text style";
@@ -1801,6 +1818,7 @@ export component App inherits Window {
     in property <[TrackUi]> video-tracks;
     in property <[TrackUi]> audio-tracks;
     in property <[TrackUi]> sub-tracks;
+    in property <float> init-sub-font-size: 55;
     in property <[RecentUi]> recents;
     in property <[QueueItem]> queue;
     in-out property <bool> drawer-open: false;
@@ -2248,6 +2266,7 @@ export component App inherits Window {
             video-tracks: root.video-tracks;
             audio-tracks: root.audio-tracks;
             sub-tracks: root.sub-tracks;
+            init-sub-font-size: root.init-sub-font-size;
             select-video(i) => { root.select-video(i); }
             select-audio(i) => { root.select-audio(i); }
             select-sub(i) => { root.select-sub(i); }

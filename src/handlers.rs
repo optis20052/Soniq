@@ -205,6 +205,9 @@ pub fn build(app: &App) -> Ctx {
     app.set_sub_tracks(ModelRc::from(sub_model.clone()));
     app.set_recents(ModelRc::from(recents_model.clone()));
     app.set_queue(ModelRc::from(queue_model.clone()));
+    // Seed the quick-settings "Size" slider with the persisted subtitle font
+    // size so it matches the Preferences subtitle page.
+    app.set_init_sub_font_size(sub_style.borrow().font_size as f32);
 
     let refresh_recents: Rc<dyn Fn()> = {
         let store = store.clone();
@@ -1013,6 +1016,10 @@ pub fn wire(app: &App, ctx: &Ctx) -> Rc<dyn Fn(bool)> {
                     sub_style.borrow_mut().scale = val as f64;
                     persist();
                 }
+                "sub-font-size" => {
+                    sub_style.borrow_mut().font_size = val.round() as i64;
+                    persist();
+                }
                 "sub-pos" => {
                     sub_style.borrow_mut().pos = val as f64;
                     persist();
@@ -1447,6 +1454,19 @@ pub fn housekeeping(app: &App, ctx: &Ctx) {
                 a.set_win_square(square_now);
 
 
+                // Window focus: when Soniq isn't the focused window (the user
+                // alt-tabbed or moved to another monitor's window) the chrome
+                // should drop immediately — the hover pin is stale (a pointer
+                // that left the surface can leave has-hover stuck true, and the
+                // user isn't reaching for controls they can't see). Defaults to
+                // focused if winit can't tell us, so we never hide spuriously.
+                let focused = {
+                    use slint::winit_030::WinitWindowAccessor;
+                    a.window()
+                        .with_winit_window(|w| w.has_focus())
+                        .unwrap_or(true)
+                };
+
                 // auto-hide chrome — but never while the pointer is resting over
                 // the top bar or floating controls (the user is reaching for
                 // them; a still cursor fires no motion events, so without this
@@ -1455,8 +1475,9 @@ pub fn housekeeping(app: &App, ctx: &Ctx) {
                     && !a.get_paused()
                     && !a.get_drawer_open()
                     && !a.get_url_open()
-                    && !a.get_chrome_hovered()
-                    && last_activity.get().elapsed() > Duration::from_millis(2500)
+                    && (!focused
+                        || (!a.get_chrome_hovered()
+                            && last_activity.get().elapsed() > Duration::from_millis(2500)))
                 {
                     a.set_chrome_shown(false);
                 }
